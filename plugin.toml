@@ -5,4 +5,3 @@ version = "0.1.0"
 description = "The omp statusline, remade for Tern: usage bars, model, spend, memory, AWS and kube segments."
 icon = "gauge"
 window = "window.luau"
-styles = ["statusline.css"]
