@@ -23,17 +23,28 @@ function ompBin() {
 	return process.env.OMP_BIN || process.env.OMP_PATH || "omp";
 }
 
+// The GUI Tern process may not carry the user's PATH; the installed omp binary is the fallback.
+function ompPaths() {
+	return [ompBin(), `${homedir()}/Library/Application Support/Tern/omp/bin/omp`];
+}
+
 function fetchUsageJson() {
+	const argv = ["usage", "--json"];
+	const opts = { timeout: 15_000, maxBuffer: 4 * 1024 * 1024 };
 	return new Promise((resolve) => {
-		execFile(ompBin(), ["usage", "--json"], { timeout: 15_000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
-			if (err) return resolve(undefined);
-			try {
-				const doc = JSON.parse(stdout.toString("utf8"));
-				resolve(doc && typeof doc === "object" ? doc : undefined);
-			} catch {
-				resolve(undefined);
-			}
-		});
+		const attempt = (index) => {
+			if (index >= ompPaths().length) return resolve(undefined);
+			execFile(ompPaths()[index], argv, opts, (err, stdout) => {
+				if (err) return attempt(index + 1);
+				try {
+					const doc = JSON.parse(stdout.toString("utf8"));
+					resolve(doc && typeof doc === "object" ? doc : undefined);
+				} catch {
+					attempt(index + 1);
+				}
+			});
+		};
+		attempt(0);
 	});
 }
 
@@ -46,7 +57,9 @@ function isTrackedProvider(provider) {
 function windowsFor(limit) {
 	const window = limit?.window;
 	const label = typeof window?.label === "string" ? window.label : undefined;
-	const frac = typeof limit?.remainingFraction === "number" ? limit.remainingFraction : undefined;
+	// the report nests shares under `amount` (older drafts had it at the top level)
+	const raw = limit?.amount?.remainingFraction ?? limit?.remainingFraction;
+	const frac = typeof raw === "number" ? raw : undefined;
 	if (!label || frac === undefined) return undefined;
 	const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
 	const resetsAt = typeof window?.resetsAt === "number" ? window.resetsAt : undefined;

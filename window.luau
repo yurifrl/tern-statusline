@@ -1,7 +1,7 @@
 --!strict
 -- omp Statusline — the omp statusline, remade as Tern chrome segments.
 --
--- Segments (configurable order): indicator, model, usage, context, budget, cost, memory, aws, kube.
+-- Segments (configurable order): indicator, provider, usage, context, budget, cost, memory, aws, kube.
 -- Data comes from three seams, each owned by one module:
 --   agents    — `cx.agents:list()`, native: model, working/idle state, pane ids
 --   cache     — the companion extension's `~/.omp/cache/statusline.json`, async via `cx.docs:read`
@@ -26,10 +26,10 @@ local CONFIG_FILE = "/config.json"
 export type Tone = "muted" | "accent" | "ok" | "warn" | "error"
 
 -- Segment names, in default render order.
-export type SegmentName = "indicator" | "model" | "usage" | "context" | "budget" | "cost" | "memory" | "aws" | "kube"
+export type SegmentName = "indicator" | "provider" | "usage" | "context" | "budget" | "cost" | "memory" | "aws" | "kube"
 
 local SEGMENT_NAMES: { SegmentName } = {
-	"indicator", "model", "usage", "context", "budget", "cost", "memory", "aws", "kube",
+	"indicator", "provider", "usage", "context", "budget", "cost", "memory", "aws", "kube",
 }
 
 export type SegmentConfig = {
@@ -37,7 +37,6 @@ export type SegmentConfig = {
 	color: Tone?,
 	-- component-specific knobs; validated per segment below
 	icons: { [string]: string }?,
-	showModel: boolean?,
 	refreshMs: number?,
 	timeoutMs: number?,
 	envVars: { string }?,
@@ -75,11 +74,11 @@ local DEFAULTS: Config = {
 	enabled = true,
 	prefix = "",
 	order = {
-		"indicator", "model", "usage", "context", "budget", "cost", "memory", "aws", "kube",
+		"indicator", "provider", "usage", "context", "budget", "cost", "memory", "aws", "kube",
 	},
 	segments = {
 		indicator = { enabled = true, icons = DEFAULT_ICONS },
-		model = { enabled = true, showModel = false },
+		provider = { enabled = true },
 		usage = { enabled = true, barGlyphs = 8, warnAt = 25, badAt = 10 },
 		context = { enabled = true, warnAt = 50, badAt = 75 },
 		budget = { enabled = true, warnAt = 50, badAt = 75 },
@@ -124,9 +123,6 @@ local function merge_segment(name: SegmentName, input: any): SegmentConfig
 				(base.icons :: { [string]: string })[key] = icon
 			end
 		end
-	end
-	if name == "model" and input.showModel ~= nil then
-		base.showModel = input.showModel == true
 	end
 	if name == "cost" and input.showZero ~= nil then
 		base.showZero = input.showZero == true
@@ -431,13 +427,18 @@ register("indicator", function(snap, seg)
 	return { text = icons.ready, tone = "ok" }
 end)
 
--- model — the provider, optionally with the model id after a slash.
-register("model", function(snap, seg)
+-- provider — the AI provider behind the active agent's model: `aihub/aihub/glm-5.3-flash` reads
+-- `aihub`; a bare model name (no provider prefix) hides the segment.
+register("provider", function(snap, seg)
 
 	if not snap.model then
 		return nil
 	end
-	return { text = snap.model, tone = seg.color or "accent" }
+	local name = (snap.model :: string):match("^([^/]+)/")
+	if not name or name == "" then
+		return nil
+	end
+	return { text = name, tone = seg.color or "accent" }
 end)
 
 -- usage — provider windows as `5H ━●── 77% 1h` groups, joined by `·`.
@@ -589,6 +590,8 @@ local function build_rows(cfg: Config, snap: Snapshot, path: string?): { Row }
 	local rows: { Row } = {}
 	local model = snap.model or "—"
 	table.insert(rows, row("Model", model, "accent"))
+	local provider = if model ~= "—" then (model :: string):match("^[^/]+") or "—" else "—"
+	table.insert(rows, row("Provider", provider :: string, "accent"))
 	local state = snap.state
 	table.insert(rows, row("State", state, if state == "working" then "accent" elseif state == "ready" then "ok" else "muted"))
 	for _, provider in snap.providers do
@@ -1008,7 +1011,7 @@ local function open_detail(cx: WindowCx)
 		dock = tern.ui.el("div", { class = "tsl-dock" }, {
 			tern.ui.el("span", { class = "tsl-hint", text = "values refresh when the statusline does" }),
 		}),
-		how = "beside",
+		how = "preview",
 	})
 	if opened then
 		panel_pane = opened

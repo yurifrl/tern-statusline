@@ -1,6 +1,6 @@
 # tern-statusline
 
-The omp statusline, remade for Tern: usage bars, model, spend, memory, AWS and kube segments.
+The omp statusline, remade for Tern: usage bars, provider, spend, memory, AWS and kube segments.
 
 One Tern window plugin (`window.luau`) plus one omp companion extension (`omp/`) that bridges the
 data only the omp process can see.
@@ -18,7 +18,7 @@ Segments, in default order:
 | Segment | Shows | Data source |
 | --- | --- | --- |
 | `indicator` | Agent state glyph: ready, working, waiting, refreshing, attention | `cx.agents:list()` |
-| `model` | Active agent's model (`showModel = true` to show) | agent list |
+| `provider` | The provider behind the agent's model — `aihub/…` reads `aihub` | agent list |
 | `usage` | Per-provider usage meter: `ZAI 5H ━━●─── 50% left` | the cache file (`omp usage --json`) |
 | `context` | Composer context meter, scraped: `󰆧 23%` | the cache file |
 | `budget` | Gateway daily spend: `󰆼 $12/$200` | the AIHub gateway `/v1/me/usage` |
@@ -44,10 +44,9 @@ Unknown keys and bad values fall back to defaults; a corrupt file never fails to
 {
   "enabled": true,
   "prefix": "",
-  "order": ["indicator", "model", "usage", "context", "budget", "cost", "memory", "aws", "kube"],
+  "order": ["indicator", "provider", "usage", "context", "budget", "cost", "memory", "aws", "kube"],
   "segments": {
     "indicator": { "icons": { "ready": "󰄾", "working": "󰙨" } },
-    "model": { "showModel": false },
     "usage": { "barGlyphs": 8, "warnAt": 25, "badAt": 10 },
     "context": { "warnAt": 50, "badAt": 75 },
     "budget": { "warnAt": 50, "badAt": 75 },

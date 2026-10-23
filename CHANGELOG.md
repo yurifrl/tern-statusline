@@ -4,7 +4,7 @@
 
 First release: the omp statusline, remade for Tern.
 
-- Nine segments: indicator, model, usage meters per provider, context, gateway budget, session
+- Nine segments: indicator, provider, usage meters per provider, context, gateway budget, session
   cost, agent memory, AWS profile, kube context.
 - Prebuilt status table — the formatter returns cached segments under Tern's 4 ms hook budget;
   every poller rebuilds it through one `publish` path.

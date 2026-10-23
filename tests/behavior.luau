@@ -242,7 +242,7 @@ test("hides the whole line when disabled", function()
 	assert(t.status_for(fake_pane()) == nil, "disabled means no segments")
 end)
 
-test("renders model and indicator from the agent list", function()
+test("renders provider and indicator from the agent list", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
 	load_window_plugin(t)
@@ -253,7 +253,8 @@ test("renders model and indicator from the agent list", function()
 		table.insert(texts, segment.text)
 	end
 	local joined = table.concat(texts, " ")
-	assert(joined:find("glm%-5%.3%-flash", 1, false) ~= nil, "model text shows: " .. joined)
+	assert(joined:find("aihub", 1, true) ~= nil, "provider text shows: " .. joined)
+	assert(joined:find("glm%-5%.3%-flash", 1, false) == nil, "model id stays hidden: " .. joined)
 	assert(joined:find("󰙨", 1, true) ~= nil, "working glyph shows: " .. joined)
 end)
 
@@ -266,6 +267,27 @@ test("usage segment draws the cache's windows with share and countdown", functio
 	assert(joined:find("ZAI 5H", 1, true) ~= nil, "provider label shows: " .. joined)
 	assert(joined:find("90%% left", 1, false) ~= nil, "share shows: " .. joined)
 	assert(joined:find("4h", 1, true) ~= nil, "countdown shows: " .. joined)
+end)
+
+test("usage share reads remainingFraction from amount (omp's real shape)", function()
+	local t = fake_tern()
+	load_window_plugin(t)
+	-- the shape `omp usage --json` emits: the share lives under `amount`
+	t.reads["/home/test/.omp/cache/statusline.json"] = t.json._encode({
+		generatedAt = 1_000_000,
+		providers = {
+			{
+				id = "zai",
+				label = "ZAI",
+				windows = { { label = "5 Hours", pct = 56, reset = "3h" } },
+			},
+		},
+	})
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("ZAI 5 Hours", 1, true) ~= nil, "provider label shows: " .. joined)
+	assert(joined:find("56%% left", 1, false) ~= nil, "share shows: " .. joined)
+	assert(joined:find("3h", 1, true) ~= nil, "countdown shows: " .. joined)
 end)
 
 test("usage bar respects configured barGlyphs", function()
@@ -286,6 +308,8 @@ end)
 test("config round-trips through kv with unknown values falling back", function()
 	local t = fake_tern()
 	load_window_plugin(t)
+	-- the kv mirror may carry a stale prefix from an earlier run (the poller mirrors the file only
+	-- when it changed); the bar must still render with the old prefix present
 	t.kv.store["config"] = { prefix = "▍", segments = { usage = { color = "electric" } } }
 	t:tick(2)
 	local segments = t.status_for(fake_pane())
