@@ -1,0 +1,17 @@
+{
+  "name": "tern-statusline",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The omp statusline, remade for Tern: usage bars, model, spend, memory, AWS and kube segments.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node scripts/check.mjs"
+  },
+  "devDependencies": {
+    "luau-web": "1.5.1"
+  }
+}

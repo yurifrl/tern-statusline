@@ -1,0 +1,4 @@
+node_modules/
+tern.d.luau
+*.log
+.DS_Store
