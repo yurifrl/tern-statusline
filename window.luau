@@ -1084,7 +1084,15 @@ end)
 if not detail_sheet_installed then
 	detail_sheet_installed = true
 	tern.css(DETAIL_SHEET, detail.sheet())
-	tern.css("statusline-chrome", "footer#statusline .sl-git { display: none !important; }")
+	tern.css("statusline-chrome", table.concat({
+		"footer#statusline .sl-git { display: none !important; }",
+		-- the idle run dot and the pane size carry nothing the segments don't; hiding them also
+		-- removes the stretch between the cwd and the plugin segments
+		"footer#statusline .sl-run.idle { display: none !important; }",
+		"footer#statusline .sl-n { display: none !important; }",
+		-- the cwd parks at the bar's end, right before the plugin segments
+		"footer#statusline .sl-cwd { order: 99 !important; margin-left: 12px !important; }",
+	}, "\n"))
 end
 
 -- Boot: first refresh soon (the extension's cache lands when omp writes it), then cadences.
