@@ -1079,10 +1079,12 @@ tern.on("pane_closed", function(ev: { pane: number })
 	end
 end)
 
--- The detail sheet reaches plugin blocks by their data-surface.
+-- Sheets: the detail view styles its own classes; the chrome sheet hides tern's built-in git
+-- segment, whose branch reads twice next to the plugin's segments (no settings knob for it).
 if not detail_sheet_installed then
 	detail_sheet_installed = true
 	tern.css(DETAIL_SHEET, detail.sheet())
+	tern.css("statusline-chrome", "footer#statusline .sl-git { display: none !important; }")
 end
 
 -- Boot: first refresh soon (the extension's cache lands when omp writes it), then cadences.
