@@ -3,7 +3,7 @@
 --
 -- Segments (configurable order): indicator, model, usage, context, budget, cost, memory, aws, kube.
 -- Data comes from three seams, each owned by one module:
---   agents    — `tern.agents:list()`, native: model, working/idle state, pane ids
+--   agents    — `cx.agents:list()`, native: model, working/idle state, pane ids
 --   cache     — the companion extension's `~/.omp/cache/statusline.json`, async via `cx.docs:read`
 --   process   — `tern.process.run` polls: kube context, memory RSS
 --
@@ -666,7 +666,7 @@ end
 -- Wires data to the status bar: one focus/refresh loop, per-source pollers, and the prebuilt
 -- segment table the 4 ms formatter returns. Owns all timing.
 
-type StatusSegment = { text: string, icon: string?, tone: string? }
+type StatusSegment = { text: string, icon: string?, tone: string?, command: string? }
 
 -- Gateway: one fetch shared by nothing but us; retains the last snapshot on failure.
 local gateway = {}
@@ -737,13 +737,24 @@ local function publish()
 	rebuild()
 end
 
+local last_cx: WindowCx? = nil
+
 local function poll_agents()
 	-- the cadence is also when another window's saved settings reach this one
 	local next_cfg = config.load()
 	if next_cfg ~= cfg then
 		cfg = next_cfg
 	end
-	local blocks = tern.agents.list()
+	local cx = last_cx
+	if cx == nil then
+		return
+	end
+	local ok, blocks = pcall(function()
+		return cx.agents:list()
+	end)
+	if not ok or type(blocks) ~= "table" then
+		return
+	end
 	local chosen: any = nil
 	local pane = shown_pane
 	if pane then
@@ -934,12 +945,15 @@ local function poll_gateway()
 	end)
 end
 
+local SETTINGS_ACTION = "plugin." .. tern.plugin.id .. ".settings"
+
 -- The status bar assembly: config order, hidden disabled/empty segments, prefix in front.
+-- Every segment carries the settings command: a click opens the panel.
 local function compose(cfg0: Config, snap: Snapshot): ({ StatusSegment }, string)
 	local out: { StatusSegment } = {}
 	local sig = {}
 	if cfg0.prefix ~= "" and cfg0.prefix ~= "none" then
-		table.insert(out, { text = cfg0.prefix, tone = "muted" })
+		table.insert(out, { text = cfg0.prefix, tone = "muted", command = SETTINGS_ACTION })
 		table.insert(sig, "p:" .. cfg0.prefix)
 	end
 	for _, name in cfg0.order do
@@ -948,7 +962,7 @@ local function compose(cfg0: Config, snap: Snapshot): ({ StatusSegment }, string
 			local rendered = segments.render(name, snap, seg)
 			local item = rendered :: Rendered?
 			if item then
-				table.insert(out, { text = item.text, tone = item.tone })
+				table.insert(out, { text = item.text, tone = item.tone, command = SETTINGS_ACTION })
 				table.insert(sig, name .. ":" .. item.text .. ":" .. (item.tone or ""))
 			end
 		end
@@ -995,10 +1009,6 @@ end)
 -- redraws the line — so the menu saves to file, which is the preferred behavior.
 
 local PANEL_KEYS = "ctrl+alt+s"
-
-local DETAIL_ACTION = "plugin." .. tern.plugin.id .. ".detail"
-local SETTINGS_ACTION = "plugin." .. tern.plugin.id .. ".settings"
-local TOGGLE_ACTION = "plugin." .. tern.plugin.id .. ".toggle"
 
 local panel_pane: number? = nil
 
@@ -1298,7 +1308,13 @@ end
 
 -- ── wiring ──
 
+-- Cadence pollers run outside callbacks and need `cx` (agents, docs); window_start gives them one.
+tern.on("window_start", function(cx: WindowCx)
+	last_cx = cx
+end)
+
 tern.on("focus", function(_ev, cx: WindowCx)
+	last_cx = cx
 	chrome.refresh()
 	sync_panel(cx)
 end)
@@ -1308,23 +1324,8 @@ tern.command({ id = "settings", title = "omp Statusline: Settings…", icon = "s
 tern.command({ id = "detail", title = "omp Statusline: Detail…", icon = "gauge", run = open_detail })
 tern.command({ id = "toggle", title = "omp Statusline: Toggle", icon = "power", run = toggle })
 
--- `statusline` in the status bar, on agent panes: a click opens settings.
-
--- The status bar formatter must stay pure and under budget; the click actions run from events.
-
-tern.on("action", function(ev, cx: WindowCx): boolean
-	if ev.action == SETTINGS_ACTION then
-		menu(cx)
-		return true
-	elseif ev.action == DETAIL_ACTION then
-		open_detail(cx)
-		return true
-	elseif ev.action == TOGGLE_ACTION then
-		toggle(cx)
-		return true
-	end
-	return false
-end)
+-- Clicks on the bar: each segment carries `command = plugin.<id>.settings`, which tern runs
+-- against the registered command — no separate event.
 
 -- Panels close when their pane goes.
 tern.on("pane_closed", function(ev: { pane: number })
@@ -1356,7 +1357,7 @@ local function cadence(ms: number, fn: () -> ())
 		local ok, err = pcall(fn)
 		if not ok then
 			-- a failing poller must not take the others down; log once per failure
-			tern.log("statusline poll failed: " .. tostring(err))
+			tern.log.warn("statusline poll failed: " .. tostring(err))
 		end
 		tern.timer(ms, tick)
 	end

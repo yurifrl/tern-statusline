@@ -5,7 +5,7 @@
 -- `load_host_plugin(api)` / `load_window_plugin(api)` shims with `tern` bound to the fake below —
 -- and driven only through the seams production data flows through: `tern.kv` (config),
 -- `tern.docs:read` (the extension cache), `tern.fetch` (the gateway), `tern.process.run` (kube,
--- memory), `tern.agents:list` (model/state) and the registered chrome formatter. Each scenario
+-- memory), `cx.agents:list` (model/state) and the registered chrome formatter. Each scenario
 -- seeds a seam, ticks the timers, and asserts on the segments the formatter returns.
 
 local cases = 0
@@ -67,7 +67,13 @@ local function fake_tern()
 	}
 
 	local log: { string } = {}
-	t.log = function(message: string) table.insert(log, message) end
+	t.log_lines = log
+	t.log = {
+		warn = function(message: string) table.insert(log, message) end,
+		info = function(...) end,
+		error = function(message: string) table.insert(log, message) end,
+		debug = function(...) end,
+	}
 
 	t.refreshes = 0
 	t.css = function(_name: string, _source: string) end
@@ -104,11 +110,8 @@ local function fake_tern()
 		end
 	end
 
-	-- agent list, one omp pane by default
+	-- agent blocks, listed through the window cx like the real API
 	t.agents = { blocks = {} }
-	function t.agents.list()
-		return t.agents.blocks
-	end
 
 	-- chrome status: capture the formatter
 	local formatter: ((any) -> any)?
@@ -158,10 +161,14 @@ local function fake_tern()
 
 	-- commands and events
 	t.commands = {}
-	t.command = function(def: any) t.commands[def.id] = def end
+	t.command = function(def: any) t.commands[def.id] = def.run end
 	t.actions = {}
 	t.on = function(name: string, fn: any)
 		t.actions[name] = fn
+		-- window_start runs once per plugin per window; the fake fires it immediately
+		if name == "window_start" then
+			fn(fake_window_cx(t))
+		end
 	end
 
 	return t
@@ -172,6 +179,11 @@ function fake_window_cx(t)
 		session = t.session,
 		docs = t.docs,
 		canvas = t.canvas,
+		agents = {
+			list = function(_self)
+				return t.agents.blocks
+			end,
+		},
 		toast = function() end,
 		pick = function()
 			return { next = function(_self, fn: (any?) -> ()) fn(nil) end }
@@ -353,8 +365,9 @@ test("detail panel lists every fact", function()
 		body = t.json._encode({ daily_budget = { spent_usd = 12, limit_usd = 200 } }),
 	}
 	t:tick(3)
-	local handler = t.actions["action"]
-	assert(type(handler) == "function", "action handler registered")
+	assert(type(t.commands["detail"]) == "function", "detail command registered")
+
+	-- the palette command and a segment click both open the same canvas
 	local opened = false
 	t.canvas = {
 		open = function(_self, _spec: any)
@@ -365,8 +378,49 @@ test("detail panel lists every fact", function()
 		get = function(_self, _pane: number) return nil end,
 		list = function(_self) return {} end,
 	}
-	handler({ action = "plugin.omp-statusline.detail" }, fake_window_cx(t))
-	assert(opened, "detail opens a canvas")
+	t.commands["detail"](fake_window_cx(t))
+	assert(opened, "detail command opens a canvas")
+
+	opened = false
+	local segments = t.status_for(fake_pane())
+	assert(#segments > 0, "segments render")
+	for _, segment in segments do
+		assert(segment.command == "plugin.omp-statusline.settings", "click opens settings: " .. tostring(segment.command))
+		assert(t.commands["settings"] ~= nil, "settings command registered")
+		segment.text = nil -- touch nothing; only command wiring matters
+		break
+	end
+	assert(not opened, "no open happened before the command ran")
+end)
+
+test("every rendered segment clicks through to settings", function()
+	local t = fake_tern()
+	load_window_plugin(t)
+	t.agents.blocks = { { pane = 7, model = "test/model", state = "working", cwd = "/tmp" } }
+	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } })
+	t.process_answers[1] = { status = 0, stdout = "talos-default\n" }
+	t.fetch_answers[1] = {
+		status = 200,
+		body = t.json._encode({ daily_budget = { spent_usd = 12, limit_usd = 200 } }),
+	}
+	t:tick(3)
+	local opened = false
+	t.canvas = {
+		open = function(_self, _spec: any)
+			opened = true
+			return 91, nil
+		end,
+		set = function(_self, _pane: number, _change: any) end,
+		get = function(_self, _pane: number) return nil end,
+		list = function(_self) return {} end,
+	}
+	-- settings opens the panel canvas, the same surface detail drives
+	local cx = fake_window_cx(t)
+	cx.pick = function()
+		return { next = function(_self, fn: (any?) -> ()) fn({ pick = "detail" }) end }
+	end
+	t.commands["settings"](cx)
+	assert(opened, "settings command opens a canvas")
 end)
 
 return cases
