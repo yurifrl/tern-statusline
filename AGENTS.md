@@ -5,7 +5,7 @@ Guidance for agents working in this repository.
 ## Layout
 
 - `window.luau` — the Tern window plugin. Packages in order: `config` · `format` · `data` ·
-  `segments` · `chrome` · `detail` · `settings`. Read the package banner comments first.
+  `segments` · `chrome` · `detail` · `panel`. Read the package banner comments first.
 - `omp/statusline-cache.js` — companion omp extension; writes `~/.omp/cache/statusline.json`.
 - `tests/behavior.luau` — the only test surface. Scenarios drive the fake `tern` in
   `fake_tern()` and assert rendered output through `joined_for`.

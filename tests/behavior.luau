@@ -385,15 +385,15 @@ test("detail panel lists every fact", function()
 	local segments = t.status_for(fake_pane())
 	assert(#segments > 0, "segments render")
 	for _, segment in segments do
-		assert(segment.command == "plugin.omp-statusline.settings", "click opens settings: " .. tostring(segment.command))
-		assert(t.commands["settings"] ~= nil, "settings command registered")
+		assert(segment.command == "plugin.omp-statusline.detail", "click opens detail: " .. tostring(segment.command))
+		assert(t.commands["detail"] ~= nil, "detail command registered")
 		segment.text = nil -- touch nothing; only command wiring matters
 		break
 	end
 	assert(not opened, "no open happened before the command ran")
 end)
 
-test("every rendered segment clicks through to settings", function()
+test("every rendered segment clicks through to detail", function()
 	local t = fake_tern()
 	load_window_plugin(t)
 	t.agents.blocks = { { pane = 7, model = "test/model", state = "working", cwd = "/tmp" } }
@@ -414,13 +414,9 @@ test("every rendered segment clicks through to settings", function()
 		get = function(_self, _pane: number) return nil end,
 		list = function(_self) return {} end,
 	}
-	-- settings opens the panel canvas, the same surface detail drives
-	local cx = fake_window_cx(t)
-	cx.pick = function()
-		return { next = function(_self, fn: (any?) -> ()) fn({ pick = "detail" }) end }
-	end
-	t.commands["settings"](cx)
-	assert(opened, "settings command opens a canvas")
+	-- the palette command and a segment click open the same read-only panel
+	t.commands["detail"](fake_window_cx(t))
+	assert(opened, "detail command opens a canvas")
 end)
 
 return cases

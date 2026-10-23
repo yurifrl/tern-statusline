@@ -11,12 +11,12 @@
 -- disables every plugin timer until reload). The formatter does ZERO work: segments are prebuilt
 -- into upvalues by poll callbacks, and the formatter only returns the table.
 --
--- Layout (packages, not sections): config · format · data · segments · chrome · detail · settings.
+-- Layout (packages, not sections): config · format · data · segments · chrome · detail · panel.
 -- Each package owns its state; cross-package calls go through the public functions listed in
 -- each header. See AGENTS.md for the rules this layout follows.
 
 -- ── package: config ────────────────────────────────────────────────────────────
--- Reads and writes the config file (`~/.config/tern-statusline/config.json`, overridable via
+-- Reads the config file (`~/.config/tern-statusline/config.json`, overridable via
 -- `TERN_STATUSLINE_CONFIG`), keeps it in `tern.kv` as the live mirror, and validates user JSON
 -- at the boundary: unknown values fall back to defaults, nothing throws.
 
@@ -99,8 +99,9 @@ for _, name in SEGMENT_NAMES do
 	NAME_SET[name] = true
 end
 
--- What the settings read and write. `tern.kv` is the live mirror every window sees; the file is
--- the durable copy the next launch loads. Both go through here, so one validation serves both.
+-- What the file says is what every window shows. `tern.kv` is the live mirror every window reads;
+-- `from_file` (the only writer of the mirror) validates with the same rules, so a hand edit and a
+-- restart land on identical state.
 local store = {
 	file = nil :: string?,
 	dirty = false,
@@ -244,23 +245,19 @@ local function load(): Config
 	return normalize(nil)
 end
 
-local function save(cfg: Config): ()
-	tern.kv.set("config", cfg)
-end
-
 local function from_file(text: string): Config
 	local ok, value = pcall(function(): any
 		return tern.json.decode(text)
 	end)
 	local cfg = if ok then normalize(value) else normalize(nil)
-	save(cfg)
+	-- the file is the one writer; the kv mirror only mirrors it, so every window sees the same
+	tern.kv.set("config", cfg)
 	return cfg
 end
 
 	config.DEFAULTS = DEFAULTS
 	config.SEGMENT_NAMES = SEGMENT_NAMES
 	config.load = load
-	config.save = save
 	config.from_file = from_file
 	config.path = config_path
 
@@ -740,11 +737,6 @@ end
 local last_cx: WindowCx? = nil
 
 local function poll_agents()
-	-- the cadence is also when another window's saved settings reach this one
-	local next_cfg = config.load()
-	if next_cfg ~= cfg then
-		cfg = next_cfg
-	end
 	local cx = last_cx
 	if cx == nil then
 		return
@@ -945,15 +937,15 @@ local function poll_gateway()
 	end)
 end
 
-local SETTINGS_ACTION = "plugin." .. tern.plugin.id .. ".settings"
+local DETAIL_ACTION = "plugin." .. tern.plugin.id .. ".detail"
 
 -- The status bar assembly: config order, hidden disabled/empty segments, prefix in front.
--- Every segment carries the settings command: a click opens the panel.
+-- Every segment carries the detail command: a click opens the panel.
 local function compose(cfg0: Config, snap: Snapshot): ({ StatusSegment }, string)
 	local out: { StatusSegment } = {}
 	local sig = {}
 	if cfg0.prefix ~= "" and cfg0.prefix ~= "none" then
-		table.insert(out, { text = cfg0.prefix, tone = "muted", command = SETTINGS_ACTION })
+		table.insert(out, { text = cfg0.prefix, tone = "muted", command = DETAIL_ACTION })
 		table.insert(sig, "p:" .. cfg0.prefix)
 	end
 	for _, name in cfg0.order do
@@ -962,7 +954,7 @@ local function compose(cfg0: Config, snap: Snapshot): ({ StatusSegment }, string
 			local rendered = segments.render(name, snap, seg)
 			local item = rendered :: Rendered?
 			if item then
-				table.insert(out, { text = item.text, tone = item.tone, command = SETTINGS_ACTION })
+				table.insert(out, { text = item.text, tone = item.tone, command = DETAIL_ACTION })
 				table.insert(sig, name .. ":" .. item.text .. ":" .. (item.tone or ""))
 			end
 		end
@@ -981,13 +973,9 @@ rebuild = function()
 	end
 end
 
-function chrome.refresh(new_cfg: Config?)
-	if new_cfg then
-		cfg = new_cfg
-	else
-		-- another window may have saved settings; the kv mirror is shared
-		cfg = config.load()
-	end
+function chrome.refresh()
+	-- another window may have saved settings; the kv mirror is shared
+	cfg = config.load()
 	poll_agents()
 	rebuild()
 	tern.chrome.refresh()
@@ -1002,47 +990,14 @@ tern.chrome.status(function(pane: StatusPaneInfo): { StatusSegment }?
 	return built
 end)
 
--- ── package: settings ──────────────────────────────────────────────────────────
--- Settings two ways, sharing one mutation surface: the panel (a canvas beside the focused pane)
--- and the palette menu (`cx:pick` trees). Every change goes through `apply`, which saves to
--- `tern.kv` (all windows see it at once), rewrites the config file via `tern.docs:write`, and
--- redraws the line — so the menu saves to file, which is the preferred behavior.
-
-local PANEL_KEYS = "ctrl+alt+s"
+-- ── package: panel ─────────────────────────────────────────────────────────────
+-- The config file is the single source of truth: `poll_cache` reads it every CACHE_POLL_MS and
+-- `config.from_file` normalizes it; nothing in this plugin ever writes it. The detail panel is
+-- read-only and lives here only because it owns the panel-pane plumbing.
 
 local panel_pane: number? = nil
 
--- The config file, rewritten from the live mirror. The parent directory must exist (tern raises
--- otherwise); the install step creates it, and a failure toasts once.
-local wrote_at = 0
-local function write_file(cx: WindowCx, cfg: Config)
-	local path = config.path()
-	if not path then
-		return
-	end
-	local ok, writing = pcall(function(): any
-		return cx.docs:write(path :: string, tern.json.encode(cfg))
-	end)
-	if ok and writing then
-		-- the file now matches the mirror; the next differing read is someone else's change
-		config_text = tern.json.encode(cfg)
-		writing:next(function(_range: any, err: string?)
-			if err and os.time() * 1000 - wrote_at > 60000 then
-				wrote_at = os.time() * 1000
-				local dir = (path :: string):match("(.*/)") or ""
-				cx:toast("error", "statusline config: " .. err, "Create " .. dir .. " first")
-			end
-		end)
-	end
-end
-
-local function apply(cx: WindowCx, cfg: Config)
-	config.save(cfg)
-	chrome.refresh(cfg)
-	write_file(cx, cfg)
-end
-
--- The detail canvas: one row per fact, opened from the statusline click, the palette, or chord.
+-- The detail canvas: one row per fact, opened from the statusline click or the palette.
 local function open_detail(cx: WindowCx)
 	local cfg0 = config.load()
 	local view = detail.view(cfg0, data.snapshot(), config.path())
@@ -1064,8 +1019,8 @@ end
 
 local detail_sheet_installed = false
 
--- The panel keeps itself current while open: each refresh redraws it if its signature changed.
-local panel_sig: string? = nil
+-- The panel redraws itself on every focus while open; canvas:set replaces the whole view, so
+-- there is no signature to diff — the 4 ms chrome formatter is the one that diffs.
 
 local function sync_panel(cx: WindowCx)
 	local pane = panel_pane
@@ -1085,225 +1040,16 @@ local function sync_panel(cx: WindowCx)
 	end
 	local cfg0 = config.load()
 	local snap = data.snapshot()
-	local sig = tostring(snap.at) .. ":" .. tostring(#snap.providers) .. ":" .. tostring(snap.state)
-	if sig ~= panel_sig then
-		panel_sig = sig
+	-- the pane may already be closing or owned by another plugin between the scan and the set
+	local ok, err = pcall(function()
 		cx.canvas:set(pane, {
 			view = detail.view(cfg0, snap, config.path()),
 		})
-	end
-end
-
--- ── the palette menu ──
-
-local function toggle(cx: WindowCx)
-	local cfg0 = config.load()
-	cfg0.enabled = not cfg0.enabled
-	apply(cx, cfg0)
-	cx:toast("info", "Statusline " .. (if cfg0.enabled then "on" else "off"))
-end
-
-local function choose_prefix(cx: WindowCx)
-	local cfg0 = config.load()
-	cx:pick({
-		placeholder = "Prefix",
-		icon = "text",
-		items = {
-			{ label = "None", current = cfg0.prefix == "", pick = "" },
-			{ label = "State glyph (ready/working/…)", current = cfg0.prefix == "state", pick = "state" },
-		},
-	}):next(function(item: PickItem?, _err: string?, next_cx: WindowCx?)
-		if item then
-			local cfg1 = config.load()
-			cfg1.prefix = (item :: any).pick
-			apply(next_cx or cx, cfg1)
-		end
 	end)
-end
-
--- One toggle entry per segment, in config order; a second pick reorders.
-local function choose_order(cx: WindowCx)
-	local cfg0 = config.load()
-	local items: { any } = {}
-	for _, name in config.SEGMENT_NAMES do
-		local seg = cfg0.segments[name]
-		table.insert(items, {
-			label = name,
-			detail = if seg and seg.enabled then "shown" else "hidden",
-			pick = name,
-		})
+	if not ok then
+		panel_pane = nil
+		tern.log.warn("statusline panel: " .. tostring(err))
 	end
-	cx:pick({ placeholder = "Show which segments first?", items = items, icon = "list" }):next(function(item, _err, next_cx)
-		if not item then
-			return
-		end
-		local first = (item :: any).pick :: SegmentName
-		local rest: { SegmentName } = {}
-		for _, name in cfg0.order do
-			if name ~= first then
-				table.insert(rest, name)
-			end
-		end
-		local order = { first }
-		for _, name in rest do
-			table.insert(order, name)
-		end
-		local cfg1 = config.load()
-		cfg1.order = order
-		apply(next_cx or cx, cfg1)
-	end)
-end
-
--- Per-segment summary line for the chooser.
-local function segment_detail(cfg: Config, name: SegmentName): string
-	local seg = cfg.segments[name]
-	if not seg then
-		return ""
-	end
-	local bits: { string } = { if seg.enabled then "on" else "off" }
-	if seg.color then
-		table.insert(bits, (seg.color :: string))
-	end
-	if name == "usage" and seg.warnAt then
-		table.insert(bits, string.format("warn<%d bad<%d", seg.warnAt, seg.badAt or 0))
-	end
-	if name == "model" and seg.showModel then
-		table.insert(bits, "model id")
-	end
-	return table.concat(bits, " · ")
-end
-
--- The options for one segment; toggles and color first, then its specific knobs.
-local function segment_options(cx: WindowCx, name: SegmentName)
-	local cfg0 = config.load()
-	local seg = cfg0.segments[name]
-	if not seg then
-		return
-	end
-	local items: { any } = {
-		{ label = if seg.enabled then "Disable" else "Enable", pick = "enabled" },
-		{
-			label = "Cycle color",
-			detail = if seg.color then seg.color else "default",
-			pick = "color",
-		},
-	}
-	if name == "model" then
-		table.insert(items, { label = if seg.showModel then "Hide model id" else "Show model id", pick = "showModel" })
-	elseif name == "cost" then
-		table.insert(items, { label = if seg.showZero then "Hide when $0" else "Show when $0", pick = "showZero" })
-	elseif name == "usage" then
-		table.insert(items, { label = "Bar width", detail = tostring(seg.barGlyphs or 8), pick = "barGlyphs" })
-		table.insert(items, { label = "Warn threshold", detail = if seg.warnAt then seg.warnAt .. "%" else "—", pick = "warnAt" })
-		table.insert(items, { label = "Bad threshold", detail = if seg.badAt then seg.badAt .. "%" else "—", pick = "badAt" })
-	elseif name == "context" or name == "budget" then
-		table.insert(items, { label = "Warn threshold", detail = if seg.warnAt then seg.warnAt .. "%" else "—", pick = "warnAt" })
-		table.insert(items, { label = "Bad threshold", detail = if seg.badAt then seg.badAt .. "%" else "—", pick = "badAt" })
-	elseif name == "kube" then
-		table.insert(items, { label = "Strip patterns…", detail = table.concat(seg.strip or {}, ", "), pick = "strip" })
-	elseif name == "aws" then
-		table.insert(items, { label = "Env variables…", detail = table.concat(seg.envVars or {}, ", "), pick = "envVars" })
-	end
-	cx:pick({ placeholder = name .. " options", items = items, icon = "sliders" }):next(function(item, _err, next_cx)
-		local target = next_cx or cx
-		if not item then
-			return
-		end
-		local pick = (item :: any).pick :: string
-		local cfg1 = config.load()
-		local seg1 = cfg1.segments[name]
-		if pick == "enabled" then
-			seg1.enabled = not seg1.enabled
-		elseif pick == "color" then
-			local cycle: { Tone? } = { nil, "muted", "accent", "ok", "warn", "error" }
-			local at = 1
-			for i, t in cycle do
-				if t == seg1.color then
-					at = i
-					break
-				end
-			end
-			seg1.color = cycle[at % #cycle + 1]
-		elseif pick == "showModel" then
-			seg1.showModel = not seg1.showModel
-		elseif pick == "showZero" then
-			seg1.showZero = not seg1.showZero
-		elseif pick == "barGlyphs" then
-			seg1.barGlyphs = ((seg1.barGlyphs or 8) >= 16) and 4 or (seg1.barGlyphs or 8) + 4
-		elseif pick == "warnAt" then
-			seg1.warnAt = ((seg1.warnAt or 50) >= 90) and 10 or (seg1.warnAt or 50) + 20
-		elseif pick == "badAt" then
-			seg1.badAt = ((seg1.badAt or 75) >= 95) and 20 or (seg1.badAt or 75) + 20
-		elseif pick == "strip" or pick == "envVars" then
-			target:prompt({
-				value = table.concat(if pick == "strip" then seg1.strip or {} else seg1.envVars or {}, ", "),
-				placeholder = if pick == "strip" then "patterns, comma-separated" else "env var names, comma-separated",
-				icon = "text",
-			}):next(function(text: string?, _e: string?, next2: WindowCx?)
-				if text and text ~= "" then
-					local parts: { string } = {}
-					for part in text:gmatch("[^,]+") do
-						table.insert(parts, (part:gsub("^%s+", ""):gsub("%s+$", "")))
-					end
-					if pick == "strip" then
-						seg1.strip = parts
-					else
-						seg1.envVars = parts
-					end
-					apply(next2 or target, cfg1)
-				end
-			end)
-			return
-		end
-		apply(target, cfg1)
-		segment_options(target :: any, name)
-	end)
-end
-
--- Per-segment options: color, plus the knobs each segment owns.
-local function segment_menu(cx: WindowCx)
-	local cfg0 = config.load()
-	local items: { any } = {}
-	for _, name in cfg0.order do
-		table.insert(items, { label = name, detail = segment_detail(cfg0, name), pick = name })
-	end
-	cx:pick({ placeholder = "Which segment?", items = items, icon = "sliders" }):next(function(item, _err, next_cx)
-		if item then
-			segment_options(next_cx or cx, (item :: any).pick :: SegmentName)
-		end
-	end)
-end
-
--- The settings menu: one entry per surface, every leaf applying through `apply`.
-local function menu(cx: WindowCx)
-	cx:pick({
-		placeholder = "Statusline settings",
-		icon = "sliders",
-		items = {
-			{ label = "Toggle statusline", detail = if config.load().enabled then "currently on" else "currently off", pick = "toggle" },
-			{ label = "Choose prefix…", detail = config.load().prefix == "" and "none" or config.load().prefix, pick = "prefix" },
-			{ label = "Reorder segments…", detail = table.concat(config.load().order, ", "), pick = "order" },
-			{ label = "Segment options…", detail = "colors, icons, thresholds per segment", pick = "segments" },
-			{ label = "Open detail panel…", detail = PANEL_KEYS, pick = "detail" },
-		},
-	}):next(function(item, _err, next_cx)
-		local target = next_cx or cx
-		if not item then
-			return
-		end
-		local pick = (item :: any).pick :: string
-		if pick == "toggle" then
-			toggle(target :: any)
-		elseif pick == "prefix" then
-			choose_prefix(target)
-		elseif pick == "order" then
-			choose_order(target)
-		elseif pick == "segments" then
-			segment_menu(target)
-		elseif pick == "detail" then
-			open_detail(target)
-		end
-	end)
 end
 
 -- ── wiring ──
@@ -1319,13 +1065,9 @@ tern.on("focus", function(_ev, cx: WindowCx)
 	sync_panel(cx)
 end)
 
--- Palette commands and chords.
-tern.command({ id = "settings", title = "omp Statusline: Settings…", icon = "sliders", keys = { PANEL_KEYS }, run = menu })
-tern.command({ id = "detail", title = "omp Statusline: Detail…", icon = "gauge", run = open_detail })
-tern.command({ id = "toggle", title = "omp Statusline: Toggle", icon = "power", run = toggle })
-
--- Clicks on the bar: each segment carries `command = plugin.<id>.settings`, which tern runs
--- against the registered command — no separate event.
+-- Palette command. The chord opens the detail panel; the config file is the only way to change
+-- behavior, and the README documents every key.
+tern.command({ id = "detail", title = "omp Statusline: Detail…", icon = "gauge", keys = { PANEL_KEYS }, run = open_detail })
 
 -- Panels close when their pane goes.
 tern.on("pane_closed", function(ev: { pane: number })

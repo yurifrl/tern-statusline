@@ -17,7 +17,7 @@ Segments, in default order:
 
 | Segment | Shows | Data source |
 | --- | --- | --- |
-| `indicator` | Agent state glyph: ready, working, waiting, refreshing, attention | `tern.agents.list()` |
+| `indicator` | Agent state glyph: ready, working, waiting, refreshing, attention | `cx.agents:list()` |
 | `model` | Active agent's model (`showModel = true` to show) | agent list |
 | `usage` | Per-provider usage meter: `ZAI 5H ━━●─── 50% left` | the cache file (`omp usage --json`) |
 | `context` | Composer context meter, scraped: `󰆧 23%` | the cache file |
@@ -29,9 +29,16 @@ Segments, in default order:
 
 ## Configuration
 
+The config file is the only way to change behavior — there is no settings UI:
+
+```sh
+$EDITOR ~/.config/tern-statusline/config.json   # Tern applies it within ~3 s
+```
+
 The file lives at `~/.config/tern-statusline/config.json` (respects `XDG_CONFIG_HOME`, override
-with `TERN_STATUSLINE_CONFIG`). Every window shares settings through `tern.kv`; the panel writes
-the file, so settings survive restarts.
+with `TERN_STATUSLINE_CONFIG`). The cache poller reads it, normalizes it into the `tern.kv` mirror
+every window shares, and redraws the bar — all windows converge on the file within one poll.
+Unknown keys and bad values fall back to defaults; a corrupt file never fails to load.
 
 ```json
 {
@@ -54,10 +61,8 @@ the file, so settings survive restarts.
 ```
 
 Tones cross strictly above `warnAt`/`badAt`. `barGlyphs` is the meter's total width: bars, tip
-dot and track together. Unknown keys and bad values fall back to defaults — a corrupt file never
-fails to load.
-
-Edit with the Tern palette (`plugin.tern-statusline.settings`) or the detail panel's dock.
+dot and track together. Clicking any segment opens the detail panel (read-only); the palette
+command `omp Statusline: Detail…` and the `ctrl+alt+s` chord open the same view.
 
 ## How it works
 
