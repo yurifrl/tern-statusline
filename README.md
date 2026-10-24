@@ -7,9 +7,12 @@ data only the omp process can see.
 
 ## Install
 
-1. Copy or symlink this directory into Tern's plugin path and restart Tern.
-2. Copy or symlink `omp/statusline-cache.js` into `~/.omp/agent/extensions/` and restart omp
-   sessions.
+1. Tern plugin: `tern plugin link <this directory>` (a git checkout; `tern plugin install
+   <git-url>` works too).
+2. omp companion: `omp plugin link <this directory>/omp` — the `tern-statusline-cache` omp
+   plugin, sourced from the same checkout. No raw symlinks into `~/.omp/agent/extensions/`.
+
+Both reload their daemons on link; restart omp sessions to pick the extension up.
 
 ## What the statusline shows
 

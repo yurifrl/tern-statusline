@@ -1,0 +1,12 @@
+{
+  "name": "tern-statusline-cache",
+  "version": "0.1.0",
+  "description": "omp plugin: writes ~/.omp/cache/statusline.json for the tern-statusline Tern plugin — context gauge, session cost, message count and provider usage windows from `omp usage --json`.",
+  "type": "module",
+  "license": "MIT",
+  "omp": {
+    "extensions": [
+      "./statusline-cache.js"
+    ]
+  }
+}
