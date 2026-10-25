@@ -890,9 +890,21 @@ local KUBE_MS = 10000
 local AWS_MS = 30000
 local MEMORY_MS = 10000
 
+-- `tern.process.run` raises when the binary can't spawn from Tern's launchd PATH; callers treat
+-- that as a failed attempt instead of losing the timer chain.
+local function run(argv: { string }, cb: (result: any, cx: any?) -> ())
+	local ok = pcall(function()
+		tern.process.run(argv, { timeout_ms = 5000 }, cb)
+	end)
+	if not ok then
+		cb({ status = -1 }, nil)
+	end
+end
+
 local function poll_kube()
-	-- Tern's PATH lacks the user's shell paths; `kubectl` by name, the absolute mise shim as fallback.
-	tern.process.run({ "kubectl", "config", "current-context" }, { timeout_ms = 5000 }, function(result, _cx)
+	-- Tern's PATH lacks the user's shell paths; `kubectl` by name works only for shell-launched
+	-- Tern, the absolute mise shim covers the Dock-launched case.
+	run({ "kubectl", "config", "current-context" }, function(result, _cx)
 		local current = if result.status == 0 then (result.stdout or ""):gsub("%s+$", "") else ""
 		if current ~= nil and (current :: string) ~= "" then
 			proc_fields.kube = current :: string
@@ -900,7 +912,7 @@ local function poll_kube()
 			return
 		end
 		-- No current-context: exactly one configured context is an unambiguous fallback
-		tern.process.run({ "/Users/yuri/.local/share/mise/shims/kubectl", "config", "get-contexts", "-o", "name" }, { timeout_ms = 5000 }, function(fallback, _cx)
+		run({ "/Users/yuri/.local/share/mise/shims/kubectl", "config", "get-contexts", "-o", "name" }, function(fallback, _cx)
 			if fallback.status ~= 0 then
 				proc_fields.kube = nil
 				publish()
@@ -922,7 +934,7 @@ end
 
 -- AWS_PROFILE is a fish universal var, not a Tern env var; `fish -N -c` serves it without config load.
 local function poll_aws()
-	tern.process.run({ "/opt/homebrew/bin/fish", "-N", "-c", "echo $AWS_PROFILE" }, { timeout_ms = 5000 }, function(result, _cx)
+	run({ "/opt/homebrew/bin/fish", "-N", "-c", "echo $AWS_PROFILE" }, function(result, _cx)
 		local value = if result.status == 0 then (result.stdout or ""):gsub("%s+$", "") else ""
 		proc_fields.aws_profile = if value ~= nil and (value :: string) ~= "" then value :: string else nil
 		publish()
@@ -930,7 +942,7 @@ local function poll_aws()
 end
 
 local function poll_memory()
-	tern.process.run({ "ps", "-axo", "rss=,command=" }, { timeout_ms = 5000 }, function(result, _cx)
+	run({ "ps", "-axo", "rss=,command=" }, function(result, _cx)
 		local stdout = if result.status == 0 then (result.stdout or "") else ""
 		if result.status ~= 0 or stdout == "" then
 			return
