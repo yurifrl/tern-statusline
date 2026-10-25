@@ -106,8 +106,10 @@ function shortProvider(provider) {
 // providers), which the plugin shows as-is — the composer bar carries the same number.
 function contextPct(ctx) {
 	const usage = ctx?.getContextUsage?.();
-	if (!usage || typeof usage.tokens !== "number" || !usage.limit) return undefined;
-	return Math.min(100, Math.round((usage.tokens / usage.limit) * 100));
+	if (!usage || typeof usage.tokens !== "number" || typeof usage.contextWindow !== "number" || usage.contextWindow <= 0) {
+		return undefined;
+	}
+	return Math.min(100, Math.round((usage.tokens / usage.contextWindow) * 100));
 }
 
 // Session cost from usage records on the active branch, summed; turns = assistant messages.
@@ -151,6 +153,8 @@ async function writeCache(ctx) {
 
 export default function statuslineCache(pi) {
 	let writing = false;
+	let timer;
+	let liveCtx;
 	const update = async (_event, ctx) => {
 		if (writing) return;
 		writing = true;
@@ -161,10 +165,14 @@ export default function statuslineCache(pi) {
 		}
 	};
 	pi.on("session_start", async (_event, ctx) => {
+		liveCtx = ctx; // ExtensionContext has no setInterval; one module timer writes the latest session's data
 		await update(_event, ctx);
-		ctx.setInterval(() => {
-			void update(_event, ctx);
-		}, USAGE_MS);
+		if (!timer) {
+			timer = setInterval(() => {
+				void update(_event, liveCtx);
+			}, USAGE_MS);
+			timer.unref?.(); // never hold the process open (print/pipe mode)
+		}
 	});
 	pi.on("turn_end", async (_event, ctx) => {
 		await update(_event, ctx);

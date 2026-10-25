@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Companion cache writes now carry context again: `contextPct` reads omp's real `ContextUsage`
+  (`tokens`/`contextWindow`) instead of the nonexistent `limit` field — the context segment and the
+  provider/usage fallbacks had been silently absent since the live-model rework.
+- The 60 s cache refresher exists again: omp's `ExtensionContext` has no `setInterval`, so the old
+  call threw inside `session_start` and every write after the first was skipped; a single
+  module-level timer now follows the live session (unref'd so print/pipe runs never hang).
+
 - Provider segment now sources from the live omp session's `ctx.model.provider` via the companion
   cache (the same source the omp/pi statusline reads), falling back from the agent block's model
   prefix — bare or missing agent model names no longer hide the label.
