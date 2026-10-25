@@ -5,7 +5,7 @@
 -- Data comes from three seams, each owned by one module:
 --   agents    — `cx.agents:list()`, native: model, working/idle state, pane ids
 --   cache     — the companion extension's `~/.omp/cache/statusline.json`, async via `cx.docs:read`
---   process   — `tern.process.run` polls: kube context, memory RSS
+--   process   — `tern.process.run` polls: kube context, aws profile, memory RSS
 --
 -- BUDGET SAFETY: `tern.chrome.status` must stay under Tern's 4 ms hook budget (over budget
 -- disables every plugin timer until reload). The formatter does ZERO work: segments are prebuilt
