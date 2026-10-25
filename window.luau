@@ -370,6 +370,7 @@ export type Snapshot = {
 	budget: { spent: number, limit: number? }?,
 	-- cache (companion extension)
 	providers: { Provider },
+	model_provider: string?, -- the live omp session's active provider, from ctx.model
 	context_pct: number?, -- composer context used, 0..100, scraped from the composer's meter
 	session_cost: string?, -- the composer bar's cost text, e.g. "$1.20"
 	session_turns: number?, -- message count, for the average
@@ -428,30 +429,44 @@ register("indicator", function(snap, seg)
 end)
 
 -- provider — the AI provider behind the active agent's model: `aihub/aihub/glm-5.3-flash` reads
--- `aihub`; a bare model name (no provider prefix) hides the segment.
+-- `aihub`; when the agent block carries a bare or missing model name, the companion cache's live
+-- `ctx.model.provider` (the same source the omp/pi statusline reads) fills in.
 register("provider", function(snap, seg)
-
-	if not snap.model then
-		return nil
+	local name = if snap.model then (snap.model :: string):match("^([^/]+)/") else nil
+	if not name or name == "" then
+		name = snap.model_provider
 	end
-	local name = (snap.model :: string):match("^([^/]+)/")
 	if not name or name == "" then
 		return nil
 	end
 	return { text = name, tone = seg.color or "accent" }
 end)
 
--- usage — provider windows as `5H ━●── 77% 1h` groups, joined by `·`.
+-- usage — the active provider's windows as `5H ━●── 77% 1h` groups, joined by `·`. Bars render
+-- only for the provider the active model is on (`zai/glm-…` → zai's windows; a provider without
+-- a quota endpoint, like aihub, hides the segment entirely).
 register("usage", function(snap, seg)
-
-	if #snap.providers == 0 then
+	local active = if snap.model then (snap.model :: string):match("^([^/]+)/") else nil
+	if not active or active == "" then
+		active = snap.model_provider
+	end
+	if not active or active == "" then
+		return nil
+	end
+	local shown: { Provider } = {}
+	for _, provider in snap.providers do
+		if provider.id == active then
+			table.insert(shown, provider)
+		end
+	end
+	if #shown == 0 then
 		return nil
 	end
 	local glyphs = seg.barGlyphs or 8
 	local parts: { string } = {}
 	local tone: Tone = seg.color or "muted"
 	local worst = 100
-	for pi, provider in snap.providers do
+	for pi, provider in shown do
 		for wi, window in provider.windows do
 			local share = window.pct
 			if share < worst then
@@ -590,7 +605,8 @@ local function build_rows(cfg: Config, snap: Snapshot, path: string?): { Row }
 	local rows: { Row } = {}
 	local model = snap.model or "—"
 	table.insert(rows, row("Model", model, "accent"))
-	local provider = if model ~= "—" then (model :: string):match("^[^/]+") or "—" else "—"
+	local provider = if snap.model_provider and snap.model_provider ~= "" then snap.model_provider
+		elseif model ~= "—" then (model :: string):match("^[^/]+") or "—" else "—"
 	table.insert(rows, row("Provider", provider :: string, "accent"))
 	local state = snap.state
 	table.insert(rows, row("State", state, if state == "working" then "accent" elseif state == "ready" then "ok" else "muted"))
@@ -712,7 +728,7 @@ local AGENT_POLL_MS = 2000
 local agent_fields: { model: string?, state: "ready" | "working" | "waiting" | "exited", pane: number? } = {
 	state = "exited",
 }
-local cache_fields: { providers: { Provider }, context_pct: number?, session_cost: string?, session_turns: number? } = {
+local cache_fields: { providers: { Provider }, model_provider: string?, context_pct: number?, session_cost: string?, session_turns: number? } = {
 	providers = {},
 }
 local proc_fields: { memory_bytes: number?, kube: string? } = {}
@@ -727,6 +743,7 @@ local function publish()
 		state = agent_fields.state,
 		budget = gateway.budget(),
 		providers = cache_fields.providers,
+		model_provider = cache_fields.model_provider,
 		context_pct = cache_fields.context_pct,
 		session_cost = cache_fields.session_cost,
 		session_turns = cache_fields.session_turns,
@@ -835,8 +852,12 @@ local function parse_cache(text: string): (typeof(cache_fields), string?)
 	if type(doc.sessionTurns) == "number" then
 		turns = doc.sessionTurns
 	end
+	local provider: string? = nil
+	if type(doc.modelProvider) == "string" and (doc.modelProvider :: string) ~= "" then
+		provider = doc.modelProvider
+	end
 	-- the file also refreshes config when its version bumps; a present file confirms the extension
-	return { providers = providers, context_pct = context, session_cost = cost, session_turns = turns }, nil
+	return { providers = providers, model_provider = provider, context_pct = context, session_cost = cost, session_turns = turns }, nil
 end
 
 local function poll_cache(cx: WindowCx?)

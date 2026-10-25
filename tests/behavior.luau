@@ -212,6 +212,7 @@ local function cache_fixture(t: any, windows: { any }): string
 		contextPct = 42,
 		sessionCost = "$1.20",
 		sessionTurns = 3,
+		modelProvider = "zai",
 	})
 end
 
@@ -258,6 +259,34 @@ test("renders provider and indicator from the agent list", function()
 	assert(joined:find("󰙨", 1, true) ~= nil, "working glyph shows: " .. joined)
 end)
 
+test("provider falls back to the cache's modelProvider on a bare or missing model", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, {})
+	load_window_plugin(t)
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("zai", 1, true) ~= nil, "cache provider shows for bare model: " .. joined)
+
+	local t2 = fake_tern()
+	t2.agents.blocks = { { pane = 7, state = "working", cwd = "/tmp" } }
+	t2.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t2, {})
+	load_window_plugin(t2)
+	t2:tick(2)
+	local joined2 = joined_for(t2)
+	assert(joined2:find("zai", 1, true) ~= nil, "cache provider shows without a model: " .. joined2)
+end)
+
+test("usage bars hide when the active provider has no quota windows", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90, reset = "4h" } })
+	load_window_plugin(t)
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("ZAI", 1, true) == nil, "usage bars stay zai-scoped on aihub: " .. joined)
+end)
+
 test("usage segment draws the cache's windows with share and countdown", function()
 	local t = fake_tern()
 	load_window_plugin(t)
@@ -282,6 +311,7 @@ test("usage share reads remainingFraction from amount (omp's real shape)", funct
 				windows = { { label = "5 Hours", pct = 56, reset = "3h" } },
 			},
 		},
+		modelProvider = "zai",
 	})
 	t:tick(2)
 	local joined = joined_for(t)

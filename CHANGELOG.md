@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Provider segment now sources from the live omp session's `ctx.model.provider` via the companion
+  cache (the same source the omp/pi statusline reads), falling back from the agent block's model
+  prefix — bare or missing agent model names no longer hide the label.
+- Usage bars render only for the active provider's windows: on `zai/glm-…` you see zai's quota
+  bars; on providers without a quota endpoint (aihub, litellm, omniroute) the segment drops out
+  instead of showing stale bars for a provider you're not spending on.
+- Detail panel's Provider row follows the same resolution.
+- Two new behavioral scenarios: cache-provider fallback, zai-scoped usage gating; 15 total.
+
 ## 0.1.0 — 2026-10-23
 
 First release: the omp statusline, remade for Tern.

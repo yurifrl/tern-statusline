@@ -7,7 +7,7 @@
 //
 // Written to ~/.omp/cache/statusline.json on session_start and after every turn:
 //   { generatedAt, providers: [{id,label,windows:[{label,pct,reset,saved}]}],
-//     contextPct, sessionCost, sessionTurns }
+//     contextPct, sessionCost, sessionTurns, modelProvider }
 //
 // Install: copy or symlink into ~/.omp/agent/extensions/ and restart omp sessions.
 
@@ -137,6 +137,7 @@ async function writeCache(ctx) {
 		contextPct: contextPct(ctx),
 		sessionCost: spend.total > 0 ? `$${spend.total.toFixed(2)}` : "$0.00",
 		sessionTurns: spend.turns,
+		modelProvider: ctx?.model?.provider,
 	};
 	try {
 		mkdirSync(dirname(CACHE_FILE), { recursive: true });
