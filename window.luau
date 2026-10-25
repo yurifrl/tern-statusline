@@ -39,7 +39,6 @@ export type SegmentConfig = {
 	icons: { [string]: string }?,
 	refreshMs: number?,
 	timeoutMs: number?,
-	envVars: { string }?,
 	strip: { string }?,
 	showZero: boolean?,
 	barGlyphs: number?,
@@ -84,7 +83,7 @@ local DEFAULTS: Config = {
 		budget = { enabled = true, warnAt = 50, badAt = 75 },
 		cost = { enabled = true, showZero = false },
 		memory = { enabled = true, refreshMs = 10000 },
-		aws = { enabled = true, envVars = { "AWS_PROFILE", "AWS_DEFAULT_PROFILE" } },
+		aws = { enabled = true },
 		kube = { enabled = true, refreshMs = 10000, timeoutMs = 5000, strip = {} },
 	},
 	detail = { enabled = true },
@@ -143,17 +142,6 @@ local function merge_segment(name: SegmentName, input: any): SegmentConfig
 		if type(input[key]) == "number" and (input[key] :: number) >= 250 then
 			local seg = base :: any
 			seg[key] = math.floor(input[key])
-		end
-	end
-	if (name == "aws" or name == "kube") and type(input.envVars) == "table" then
-		local vars: { string } = {}
-		for _, v in input.envVars do
-			if type(v) == "string" and v ~= "" then
-				table.insert(vars, v)
-			end
-		end
-		if #vars > 0 then
-			base.envVars = vars
 		end
 	end
 	if name == "kube" and type(input.strip) == "table" then
@@ -377,6 +365,7 @@ export type Snapshot = {
 	-- process polls
 	memory_bytes: number?,
 	kube: string?,
+	aws_profile: string?, -- AWS_PROFILE captured from a login fish (Tern's own env lacks it)
 	at: number, -- snapshot build time, ms
 }
 
@@ -536,17 +525,13 @@ register("memory", function(snap, seg)
 	return { text = "󰍛 " .. format.memory(snap.memory_bytes), tone = seg.color or "muted" }
 end)
 
--- aws — first configured env var holding a profile name: `☁ nsx`.
+-- aws — the login shell's AWS_PROFILE, captured by the fish poller into the snapshot: `☁ nsx`.
 register("aws", function(snap, seg)
-
-	local vars = seg.envVars or { "AWS_PROFILE", "AWS_DEFAULT_PROFILE" }
-	for _, name in vars do
-		local value = tern.getenv(name)
-		if value and value ~= "" then
-			return { text = "☁ " .. value, tone = seg.color or "warn" }
-		end
+	local value = snap.aws_profile
+	if not value or value == "" then
+		return nil
 	end
-	return nil
+	return { text = "☁ " .. value, tone = seg.color or "warn" }
 end)
 
 local function strip_all(text: string, patterns: { string }): string
@@ -731,7 +716,7 @@ local agent_fields: { model: string?, state: "ready" | "working" | "waiting" | "
 local cache_fields: { providers: { Provider }, model_provider: string?, context_pct: number?, session_cost: string?, session_turns: number? } = {
 	providers = {},
 }
-local proc_fields: { memory_bytes: number?, kube: string? } = {}
+local proc_fields: { memory_bytes: number?, kube: string?, aws_profile: string? } = {}
 
 -- Forward-declared: publish rebuilds the prebuilt bar, so every data source lands visibly.
 local rebuild: () -> ()
@@ -749,6 +734,7 @@ local function publish()
 		session_turns = cache_fields.session_turns,
 		memory_bytes = proc_fields.memory_bytes,
 		kube = proc_fields.kube,
+		aws_profile = proc_fields.aws_profile,
 		at = os.time() * 1000,
 	})
 	rebuild()
@@ -899,18 +885,46 @@ local function poll_cache(cx: WindowCx?)
 	end
 end
 
--- Process polls: kube context and omp RSS. Each on its own cadence, async callbacks only.
+-- Process polls: kube context, AWS profile and omp RSS. Each on its own cadence, async callbacks only.
 local KUBE_MS = 10000
+local AWS_MS = 30000
 local MEMORY_MS = 10000
 
 local function poll_kube()
+	-- Tern's PATH lacks the user's shell paths; `kubectl` by name, the absolute mise shim as fallback.
 	tern.process.run({ "kubectl", "config", "current-context" }, { timeout_ms = 5000 }, function(result, _cx)
-		local text = if result.status == 0 then (result.stdout or "") else ""
-		if text ~= "" then
-			proc_fields.kube = (text :: string):gsub("%s+$", "")
-		else
-			proc_fields.kube = nil
+		local current = if result.status == 0 then (result.stdout or ""):gsub("%s+$", "") else ""
+		if current ~= nil and (current :: string) ~= "" then
+			proc_fields.kube = current :: string
+			publish()
+			return
 		end
+		-- No current-context: exactly one configured context is an unambiguous fallback
+		tern.process.run({ "/Users/yuri/.local/share/mise/shims/kubectl", "config", "get-contexts", "-o", "name" }, { timeout_ms = 5000 }, function(fallback, _cx)
+			if fallback.status ~= 0 then
+				proc_fields.kube = nil
+				publish()
+				return
+			end
+			local count, only = 0, nil
+			for name in ((fallback.stdout or "") :: string):gmatch("[^\n]+") do
+				name = (name :: string):gsub("%s+$", "")
+				if name ~= "" then
+					count += 1
+					only = name
+				end
+			end
+			proc_fields.kube = if count == 1 then only else nil
+			publish()
+		end)
+	end)
+end
+
+-- AWS_PROFILE is a fish universal var, not a Tern env var; `fish -N -c` serves it without config load.
+local function poll_aws()
+	tern.process.run({ "/opt/homebrew/bin/fish", "-N", "-c", "echo $AWS_PROFILE" }, { timeout_ms = 5000 }, function(result, _cx)
+		local value = if result.status == 0 then (result.stdout or ""):gsub("%s+$", "") else ""
+		proc_fields.aws_profile = if value ~= nil and (value :: string) ~= "" then value :: string else nil
 		publish()
 	end)
 end
@@ -1143,6 +1157,7 @@ end
 cadence(AGENT_POLL_MS, poll_agents)
 cadence(GATEWAY_MS, poll_gateway)
 cadence(KUBE_MS, poll_kube)
+cadence(AWS_MS, poll_aws)
 cadence(MEMORY_MS, poll_memory)
 
 -- Gateway refresh also rebuilds the bar on fetch callbacks (they call publish); poll_agents ticks

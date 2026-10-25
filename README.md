@@ -27,7 +27,7 @@ Segments, in default order:
 | `budget` | Gateway daily spend: `󰆼 $12/$200` | the AIHub gateway `/v1/me/usage` |
 | `cost` | Session cost and per-message average | the cache file |
 | `memory` | Largest omp agent process RSS: `󰍛 283M` | `ps -axo rss=,command=` |
-| `aws` | AWS profile from `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` | environment |
+| `aws` | AWS profile captured from a login fish (`AWS_PROFILE`) | environment |
 | `kube` | Current kubectl context: `⎈ talos-default` | `kubectl config current-context` |
 
 ## Configuration
@@ -55,7 +55,7 @@ Unknown keys and bad values fall back to defaults; a corrupt file never fails to
     "budget": { "warnAt": 50, "badAt": 75 },
     "cost": { "showZero": false },
     "memory": { "refreshMs": 10000 },
-    "aws": { "envVars": ["AWS_PROFILE", "AWS_DEFAULT_PROFILE"] },
+    "aws": { "refreshMs": 30000 },
     "kube": { "strip": ["^arn:aws:eks:[^:]+:[0-9]+:cluster/"] }
   },
   "detail": { "enabled": true }

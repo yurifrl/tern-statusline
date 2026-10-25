@@ -4,7 +4,7 @@
 -- The plugin is loaded twice inside luau-web's sandboxed Luau VM — host and window sources under
 -- `load_host_plugin(api)` / `load_window_plugin(api)` shims with `tern` bound to the fake below —
 -- and driven only through the seams production data flows through: `tern.kv` (config),
--- `tern.docs:read` (the extension cache), `tern.fetch` (the gateway), `tern.process.run` (kube,
+-- `tern.docs:read` (the extension cache), `tern.fetch` (the gateway), `tern.process.run` (kube, aws,
 -- memory), `cx.agents:list` (model/state) and the registered chrome formatter. Each scenario
 -- seeds a seam, ticks the timers, and asserts on the segments the formatter returns.
 
@@ -148,15 +148,20 @@ local function fake_tern()
 		cb(answer, nil)
 	end
 
-	-- process.run records calls; scenarios answer through t.process_answers
+	-- process.run records calls; scenarios answer through t.process_answers, keyed by which
+	-- poller the argv belongs to (kube/aws/memory) so adding pollers never shifts indexes
 	t.process_calls = {}
 	t.process_answers = {}
 	t.process = {
 		run = function(argv: { string }, _opts: any, cb: (any, any?) -> ())
-		table.insert(t.process_calls, argv)
-		local answer = t.process_answers[#t.process_calls] or { status = 1, stdout = "" }
-		cb(answer, nil)
-	end,
+			table.insert(t.process_calls, argv)
+			local bin = argv[1] or ""
+			local name = if bin:find("kubectl", 1, true) then "kube"
+				elseif bin:find("fish", 1, true) then "aws"
+				else "memory"
+			local answer = t.process_answers[name] or { status = 1, stdout = "" }
+			cb(answer, nil)
+		end,
 	}
 
 	-- commands and events
@@ -379,21 +384,26 @@ test("kube applies strip patterns from config", function()
 	local t = fake_tern()
 	load_window_plugin(t)
 	t.kv.store["config"] = { segments = { kube = { strip = { "^arn:aws:eks:[^:]+:[0-9]+:cluster/" } } } }
-	-- each tick fires both process pollers (kube, memory) twice; answer every round with the arn
-	t.process_answers[1] = { status = 0, stdout = "arn:aws:eks:us-east-1:123:cluster/talos-default\n" }
-	t.process_answers[2] = t.process_answers[1]
-	t.process_answers[3] = t.process_answers[1]
-	t.process_answers[4] = t.process_answers[1]
+	-- each tick fires all process pollers; answer the kube poller every round with the arn
+	t.process_answers["kube"] = { status = 0, stdout = "arn:aws:eks:us-east-1:123:cluster/talos-default\n" }
 	t:tick(2)
 	local joined = joined_for(t)
 	assert(joined:find("⎈ talos%-default", 1, false) ~= nil, "arn prefix stripped: " .. joined)
 end)
 
+test("aws renders the fish-captured profile from the snapshot", function()
+	local t = fake_tern()
+	load_window_plugin(t)
+	t.process_answers["aws"] = { status = 0, stdout = "nsx\n" }
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("☁ nsx", 1, true) ~= nil, "aws profile shows: " .. joined)
+end)
+
 test("memory renders the largest omp agent RSS", function()
 	local t = fake_tern()
 	load_window_plugin(t)
-	t.process_answers[1] = { status = 1, stdout = "" } -- kube fails, harmless
-	t.process_answers[2] = { status = 0, stdout = "290000 /usr/local/bin/omp agent --serve\n" }
+	t.process_answers["memory"] = { status = 0, stdout = "290000 /usr/local/bin/omp agent --serve\n" }
 	t:tick(3)
 	local joined = joined_for(t)
 	assert(joined:find("283M", 1, true) ~= nil, "rss renders in MiB: " .. joined)
@@ -413,7 +423,7 @@ test("detail panel lists every fact", function()
 	load_window_plugin(t)
 	t.agents.blocks = { { pane = 7, model = "test/model", state = "working", cwd = "/tmp" } }
 	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } })
-	t.process_answers[1] = { status = 0, stdout = "talos-default\n" }
+	t.process_answers["kube"] = { status = 0, stdout = "talos-default\n" }
 	t.fetch_answers[1] = {
 		status = 200,
 		body = t.json._encode({ daily_budget = { spent_usd = 12, limit_usd = 200 } }),
@@ -452,7 +462,7 @@ test("every rendered segment clicks through to detail", function()
 	load_window_plugin(t)
 	t.agents.blocks = { { pane = 7, model = "test/model", state = "working", cwd = "/tmp" } }
 	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } })
-	t.process_answers[1] = { status = 0, stdout = "talos-default\n" }
+	t.process_answers["kube"] = { status = 0, stdout = "talos-default\n" }
 	t.fetch_answers[1] = {
 		status = 200,
 		body = t.json._encode({ daily_budget = { spent_usd = 12, limit_usd = 200 } }),

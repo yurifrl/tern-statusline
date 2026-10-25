@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The `aws` segment works in the GUI again: Tern's own environment lacks the login shell's exports,
+  so the segment now reads `AWS_PROFILE` captured by a `fish -N -c` poller into the snapshot
+  (universal vars serve it in ~30 ms) instead of `tern.getenv`, which only sees Tern's launch env.
+- The `kube` segment survives Tern's PATH: it tries `kubectl` by name, falls back to the absolute
+  mise shim, and when no current-context is set but exactly one context is configured, shows that
+  context instead of hiding.
 - Companion cache writes now carry context again: `contextPct` reads omp's real `ContextUsage`
   (`tokens`/`contextWindow`) instead of the nonexistent `limit` field — the context segment and the
   provider/usage fallbacks had been silently absent since the live-model rework.
