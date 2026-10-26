@@ -902,17 +902,18 @@ local function run(argv: { string }, cb: (result: any, cx: any?) -> ())
 end
 
 local function poll_kube()
-	-- Tern's PATH lacks the user's shell paths; `kubectl` by name works only for shell-launched
-	-- Tern, the absolute mise shim covers the Dock-launched case.
-	run({ "kubectl", "config", "current-context" }, function(result, _cx)
-		local current = if result.status == 0 then (result.stdout or ""):gsub("%s+$", "") else ""
-		if current ~= nil and (current :: string) ~= "" then
-			proc_fields.kube = current :: string
+	-- Tern's launchd PATH lacks the user's shell paths and the mise shim needs mise's env
+	-- (shim errors "no version is set" under launchd), so call the real binary. `latest` is
+	-- mise's stable symlink to the active install, surviving version bumps.
+	run({ "/Users/yuri/.local/share/mise/installs/kubectl/latest/kubectl", "config", "current-context" }, function(shim_result, _cx)
+		local shim_current = if shim_result.status == 0 then (shim_result.stdout or ""):gsub("%s+$", "") else ""
+		if shim_current ~= nil and (shim_current :: string) ~= "" then
+			proc_fields.kube = shim_current :: string
 			publish()
 			return
 		end
 		-- No current-context: exactly one configured context is an unambiguous fallback
-		run({ "/Users/yuri/.local/share/mise/shims/kubectl", "config", "get-contexts", "-o", "name" }, function(fallback, _cx)
+		run({ "/Users/yuri/.local/share/mise/installs/kubectl/latest/kubectl", "config", "get-contexts", "-o", "name" }, function(fallback, _cx)
 			if fallback.status ~= 0 then
 				proc_fields.kube = nil
 				publish()
@@ -932,9 +933,10 @@ local function poll_kube()
 	end)
 end
 
--- AWS_PROFILE is a fish universal var, not a Tern env var; `fish -N -c` serves it without config load.
+-- AWS_PROFILE is a fish universal var set with `set -Ux` (conf.d/environment.fish); fish -N
+-- skips config and doesn't export it, so load the normal config despite the startup cost.
 local function poll_aws()
-	run({ "/opt/homebrew/bin/fish", "-N", "-c", "echo $AWS_PROFILE" }, function(result, _cx)
+	run({ "/opt/homebrew/bin/fish", "-c", "echo $AWS_PROFILE" }, function(result, _cx)
 		local value = if result.status == 0 then (result.stdout or ""):gsub("%s+$", "") else ""
 		proc_fields.aws_profile = if value ~= nil and (value :: string) ~= "" then value :: string else nil
 		publish()
