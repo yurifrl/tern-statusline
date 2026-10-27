@@ -177,4 +177,9 @@ export default function statuslineCache(pi) {
 	pi.on("turn_end", async (_event, ctx) => {
 		await update(_event, ctx);
 	});
+	// /model and role switches land here before any turn; rewrite so the Tern provider
+	// segment follows within its 3 s cache poll.
+	pi.on("model_changed", async (_event, ctx) => {
+		await update(_event, ctx);
+	});
 }
