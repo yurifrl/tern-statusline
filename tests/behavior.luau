@@ -203,10 +203,11 @@ function fake_pane(kind: string?)
 	return { pane = 7, kind = kind or "agent", program = "omp", busy = false, cwd = "/tmp", title = "omp" }
 end
 
--- A statusline cache the companion extension would have written.
-local function cache_fixture(t: any, windows: { any }): string
+-- A statusline cache the companion extension would have written. `now` makes it just-written
+-- (the live modelProvider the plugin trusts); the default is an old file it must not trust.
+local function cache_fixture(t: any, windows: { any }, now: boolean?): string
 	return t.json._encode({
-		generatedAt = 1_000_000,
+		generatedAt = if now then os.time() * 1000 else 1_000_000,
 		providers = {
 			{
 				id = "zai",
@@ -262,6 +263,28 @@ test("renders provider and indicator from the agent list", function()
 	assert(joined:find("aihub", 1, true) ~= nil, "provider text shows: " .. joined)
 	assert(joined:find("glm%-5%.3%-flash", 1, false) == nil, "model id stays hidden: " .. joined)
 	assert(joined:find("󰙨", 1, true) ~= nil, "working glyph shows: " .. joined)
+end)
+
+test("a fresh cache's modelProvider beats the agent block's spawn-time model", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } }, true)
+	load_window_plugin(t)
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("zai", 1, true) ~= nil, "live provider shows after a /model switch: " .. joined)
+	assert(joined:find("ZAI 5H", 1, true) ~= nil, "usage follows the live provider too: " .. joined)
+end)
+
+test("a stale cache keeps the agent block's model", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } })
+	load_window_plugin(t)
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("aihub", 1, true) ~= nil, "spawn-time model shows when the cache is old: " .. joined)
+	assert(joined:find("ZAI 5H", 1, true) == nil, "stale cache must not drive usage bars: " .. joined)
 end)
 
 test("provider falls back to the cache's modelProvider on a bare or missing model", function()

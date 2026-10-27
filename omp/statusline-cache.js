@@ -5,7 +5,9 @@
 // `omp usage --json`, the same reports omp's own usage segment shows; the plugin's settings panel
 // can show every provider at once, not just the active one.
 //
-// Written to ~/.omp/cache/statusline.json on session_start and after every turn:
+// Written to ~/.omp/cache/statusline.json on session_start, after every turn, and once a
+// second (the touch tick keeps `generatedAt` fresh so the Tern plugin can trust
+// `modelProvider` across /model switches):
 //   { generatedAt, providers: [{id,label,windows:[{label,pct,reset,saved}]}],
 //     contextPct, sessionCost, sessionTurns, modelProvider }
 //
@@ -18,6 +20,7 @@ import { dirname, join } from "node:path";
 
 const CACHE_FILE = join(homedir(), ".omp", "cache", "statusline.json");
 const USAGE_MS = 60_000;
+const TOUCH_MS = 1_000; // provider touch; the Tern plugin's freshness gate is 15 s
 
 function ompBin() {
 	return process.env.OMP_BIN || process.env.OMP_PATH || "omp";
@@ -131,6 +134,15 @@ function sessionSpend(ctx) {
 	}
 }
 
+function writePayload(payload) {
+	mkdirSync(dirname(CACHE_FILE), { recursive: true });
+	const tmp = `${CACHE_FILE}.tmp`;
+	writeFileSync(tmp, JSON.stringify(payload));
+	renameSync(tmp, CACHE_FILE); // atomic swap: readers never see a half-file
+}
+
+let lastPayload; // the most recent full payload; the touch rewrites it with a fresh timestamp
+
 async function writeCache(ctx) {
 	const [doc, spend] = [await fetchUsageJson(), sessionSpend(ctx)];
 	const payload = {
@@ -141,11 +153,23 @@ async function writeCache(ctx) {
 		sessionTurns: spend.turns,
 		modelProvider: ctx?.model?.provider,
 	};
+	lastPayload = payload;
+	// every full write refreshes `generatedAt`; identical text is a no-op on the reader side
 	try {
-		mkdirSync(dirname(CACHE_FILE), { recursive: true });
-		const tmp = `${CACHE_FILE}.tmp`;
-		writeFileSync(tmp, JSON.stringify(payload));
-		renameSync(tmp, CACHE_FILE); // atomic swap: readers never see a half-file
+		writePayload(payload);
+	} catch {
+		// cache write failure is invisible; the plugin keeps its last good read
+	}
+}
+
+// 1 s provider touch: `ctx.model` is a live getter, so re-reading it on a fast tick catches
+// /model switches; each write bumps `generatedAt`, which is what the Tern plugin's freshness
+// gate keys on. No subprocess — it rewrites the last full payload, only the timestamp and the
+// provider change. Unchanged fields cost one small file write per second.
+function touchCache(ctx) {
+	if (!lastPayload) return; // first full write hasn't landed; session_start's update fills it
+	try {
+		writePayload({ ...lastPayload, generatedAt: Date.now(), modelProvider: ctx?.model?.provider });
 	} catch {
 		// cache write failure is invisible; the plugin keeps its last good read
 	}
@@ -154,6 +178,7 @@ async function writeCache(ctx) {
 export default function statuslineCache(pi) {
 	let writing = false;
 	let timer;
+	let touchTimer;
 	let liveCtx;
 	const update = async (_event, ctx) => {
 		if (writing) return;
@@ -173,13 +198,15 @@ export default function statuslineCache(pi) {
 			}, USAGE_MS);
 			timer.unref?.(); // never hold the process open (print/pipe mode)
 		}
+		// 1 s provider touch (touchCache, above): no subprocess, one small write.
+		if (!touchTimer) {
+			touchTimer = setInterval(() => {
+				touchCache(liveCtx);
+			}, TOUCH_MS);
+			touchTimer.unref?.();
+		}
 	});
 	pi.on("turn_end", async (_event, ctx) => {
-		await update(_event, ctx);
-	});
-	// /model and role switches land here before any turn; rewrite so the Tern provider
-	// segment follows within its 3 s cache poll.
-	pi.on("model_changed", async (_event, ctx) => {
 		await update(_event, ctx);
 	});
 }

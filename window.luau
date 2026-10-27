@@ -359,6 +359,7 @@ export type Snapshot = {
 	-- cache (companion extension)
 	providers: { Provider },
 	model_provider: string?, -- the live omp session's active provider, from ctx.model
+	cache_at: number?, -- when the cache was written (ms); freshness gates provider/usage precedence
 	context_pct: number?, -- composer context used, 0..100, scraped from the composer's meter
 	session_cost: string?, -- the composer bar's cost text, e.g. "$1.20"
 	session_turns: number?, -- message count, for the average
@@ -390,6 +391,10 @@ end
 -- (text, tone)`. Render is pure; missing data returns nil and the segment drops out. The chrome
 -- package walks `config.order`, calls these, and owns nothing about any one segment.
 
+-- A cache written within this window is "live" — the extension rewrites it every second, so a
+-- fresh modelProvider beats the agent block's spawn-time model in the provider/usage segments.
+local CACHE_FRESH_MS = 15_000
+
 local segments = {}
 
 type Render = (Snapshot, SegmentConfig) -> Rendered?
@@ -417,11 +422,19 @@ register("indicator", function(snap, seg)
 	return { text = icons.ready, tone = "ok" }
 end)
 
--- provider — the AI provider behind the active agent's model: `aihub/aihub/glm-5.3-flash` reads
--- `aihub`; when the agent block carries a bare or missing model name, the companion cache's live
--- `ctx.model.provider` (the same source the omp/pi statusline reads) fills in.
+-- provider — the AI provider behind the active model. The companion cache's `modelProvider`
+-- (omp's live `ctx.model`) is the only source that follows /model switches, so it wins while
+-- the cache is fresh (written by the extension's 1 s tick); the agent block's model string is
+-- fixed at spawn and only fills in when the cache is stale or absent.
 register("provider", function(snap, seg)
-	local name = if snap.model then (snap.model :: string):match("^([^/]+)/") else nil
+	local fresh = snap.cache_at ~= nil and os.time() * 1000 - (snap.cache_at :: number) < CACHE_FRESH_MS
+	local name: string? = nil
+	if fresh then
+		name = snap.model_provider
+	end
+	if not name or name == "" then
+		name = if snap.model then (snap.model :: string):match("^([^/]+)/") else nil
+	end
 	if not name or name == "" then
 		name = snap.model_provider
 	end
@@ -433,9 +446,17 @@ end)
 
 -- usage — the active provider's windows as `5H ━●── 77% 1h` groups, joined by `·`. Bars render
 -- only for the provider the active model is on (`zai/glm-…` → zai's windows; a provider without
--- a quota endpoint, like aihub, hides the segment entirely).
+-- a quota endpoint, like aihub, hides the segment entirely). The fresh cache's `modelProvider`
+-- leads, same precedence as the provider segment.
 register("usage", function(snap, seg)
-	local active = if snap.model then (snap.model :: string):match("^([^/]+)/") else nil
+	local fresh = snap.cache_at ~= nil and os.time() * 1000 - (snap.cache_at :: number) < CACHE_FRESH_MS
+	local active: string? = nil
+	if fresh then
+		active = snap.model_provider
+	end
+	if not active or active == "" then
+		active = if snap.model then (snap.model :: string):match("^([^/]+)/") else nil
+	end
 	if not active or active == "" then
 		active = snap.model_provider
 	end
@@ -713,7 +734,7 @@ local AGENT_POLL_MS = 2000
 local agent_fields: { model: string?, state: "ready" | "working" | "waiting" | "exited", pane: number? } = {
 	state = "exited",
 }
-local cache_fields: { providers: { Provider }, model_provider: string?, context_pct: number?, session_cost: string?, session_turns: number? } = {
+local cache_fields: { providers: { Provider }, model_provider: string?, cache_at: number?, context_pct: number?, session_cost: string?, session_turns: number? } = {
 	providers = {},
 }
 local proc_fields: { memory_bytes: number?, kube: string?, aws_profile: string? } = {}
@@ -729,6 +750,7 @@ local function publish()
 		budget = gateway.budget(),
 		providers = cache_fields.providers,
 		model_provider = cache_fields.model_provider,
+		cache_at = cache_fields.cache_at,
 		context_pct = cache_fields.context_pct,
 		session_cost = cache_fields.session_cost,
 		session_turns = cache_fields.session_turns,
@@ -842,8 +864,12 @@ local function parse_cache(text: string): (typeof(cache_fields), string?)
 	if type(doc.modelProvider) == "string" and (doc.modelProvider :: string) ~= "" then
 		provider = doc.modelProvider
 	end
+	local cache_at: number? = nil
+	if type(doc.generatedAt) == "number" then
+		cache_at = doc.generatedAt
+	end
 	-- the file also refreshes config when its version bumps; a present file confirms the extension
-	return { providers = providers, model_provider = provider, context_pct = context, session_cost = cost, session_turns = turns }, nil
+	return { providers = providers, model_provider = provider, cache_at = cache_at, context_pct = context, session_cost = cost, session_turns = turns }, nil
 end
 
 local function poll_cache(cx: WindowCx?)
