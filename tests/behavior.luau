@@ -225,6 +225,10 @@ local function cache_fixture(t: any, windows: { any }, now: boolean?, cwd: strin
 	})
 end
 
+-- The plugin reads the focused project's file: `~/.omp/cache/statusline/<cache_key>.json`. For
+-- the fixtures' cwd "/tmp" the shared encoding yields %2Ftmp — these tests pin that contract.
+local CACHE_PATH = "/home/test/.omp/cache/statusline/%2Ftmp.json"
+
 -- All segment texts the formatter currently returns, joined for substring assertions.
 local function joined_for(t: any): string
 	local texts: { string } = {}
@@ -271,7 +275,7 @@ end)
 test("a fresh cache's modelProvider beats the agent block's spawn-time model", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
-	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/tmp")
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/tmp")
 	load_window_plugin(t)
 	t:tick(2)
 	local joined = joined_for(t)
@@ -282,7 +286,7 @@ end)
 test("a fresh cache from another cwd doesn't hijack the focused pane", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
-	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/elsewhere")
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/elsewhere")
 	load_window_plugin(t)
 	t:tick(2)
 	local joined = joined_for(t)
@@ -290,10 +294,60 @@ test("a fresh cache from another cwd doesn't hijack the focused pane", function(
 	assert(joined:find("ZAI 5H", 1, true) == nil, "another writer's usage windows stay hidden: " .. joined)
 end)
 
+test("an old-shape cache doc without a cwd is hidden, not applied", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	-- a doc with no cwd cannot be scoped to any project (pre-cwd extension); hiding it is the
+	-- only safe choice, so the agent block's own model decides
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, nil)
+	load_window_plugin(t)
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("aihub", 1, true) ~= nil, "agent's own model shows over an unscoped cache: " .. joined)
+	assert(joined:find("ZAI 5H", 1, true) == nil, "unscoped usage windows stay hidden: " .. joined)
+end)
+
+test("switching focus swaps which project's cache applies", function()
+	local t = fake_tern()
+	load_window_plugin(t)
+	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/tmp")
+	t.reads["/home/test/.omp/cache/statusline/%2Fother.json"] = cache_fixture(t, { { label = "1D", pct = 20 } }, true, "/other")
+	t:tick(2)
+	assert(joined_for(t):find("ZAI 5H", 1, true) ~= nil, "the tmp project's windows show at first: " .. joined_for(t))
+	-- focus moves to the other project: the next agent poll targets its file
+	t.agents.blocks = { { pane = 9, model = "zai/glm-5.3-flash", state = "working", cwd = "/other" } }
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("ZAI 1D", 1, true) ~= nil, "the other project's windows follow focus: " .. joined)
+	assert(joined:find("ZAI 5H", 1, true) == nil, "the first project's windows are gone: " .. joined)
+end)
+
+test("memory prefers the cache's own RSS over the ps scan", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads[CACHE_PATH] = t.json._encode({
+		generatedAt = os.time() * 1000,
+		providers = {},
+		modelProvider = "aihub",
+		cwd = "/tmp",
+		kube = "",
+		rssBytes = 262144000, -- 250 MiB, not any value a ps scan would guess
+	})
+	load_window_plugin(t)
+	-- the ps poller still fires on its cadence (it can't know the cache will win); its value
+	-- must be ignored in favor of the writer's own RSS
+	t.process_answers["memory"] = { status = 0, stdout = "900000 /usr/local/bin/omp agent --serve\n" }
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("󰍛 250M", 1, true) ~= nil, "the cache's RSS renders: " .. joined)
+	assert(joined:find("879M", 1, true) == nil, "the ps scan's largest-omp guess loses: " .. joined)
+end)
+
 test("a stale cache keeps the agent block's model", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
-	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } })
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, false, "/tmp")
 	load_window_plugin(t)
 	t:tick(2)
 	local joined = joined_for(t)
@@ -304,7 +358,7 @@ end)
 test("provider falls back to the cache's modelProvider on a bare or missing model", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "glm-5.3-flash", state = "working", cwd = "/tmp" } }
-	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, {})
+	t.reads[CACHE_PATH] = cache_fixture(t, {}, false, "/tmp")
 	load_window_plugin(t)
 	t:tick(2)
 	local joined = joined_for(t)
@@ -312,7 +366,7 @@ test("provider falls back to the cache's modelProvider on a bare or missing mode
 
 	local t2 = fake_tern()
 	t2.agents.blocks = { { pane = 7, state = "working", cwd = "/tmp" } }
-	t2.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t2, {})
+	t2.reads[CACHE_PATH] = cache_fixture(t2, {}, false, "/tmp")
 	load_window_plugin(t2)
 	t2:tick(2)
 	local joined2 = joined_for(t2)
@@ -322,7 +376,7 @@ end)
 test("usage bars hide when the active provider has no quota windows", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
-	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90, reset = "4h" } })
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90, reset = "4h" } }, false, "/tmp")
 	load_window_plugin(t)
 	t:tick(2)
 	local joined = joined_for(t)
@@ -331,8 +385,10 @@ end)
 
 test("usage segment draws the cache's windows with share and countdown", function()
 	local t = fake_tern()
+	-- the scoped read needs a focused agent; a bare model lets the stale rung supply zai
+	t.agents.blocks = { { pane = 7, model = "glm-5.3-flash", state = "working", cwd = "/tmp" } }
 	load_window_plugin(t)
-	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90, reset = "4h" } })
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90, reset = "4h" } }, false, "/tmp")
 	t:tick(2)
 	local joined = joined_for(t)
 	assert(joined:find("ZAI 5H", 1, true) ~= nil, "provider label shows: " .. joined)
@@ -342,9 +398,10 @@ end)
 
 test("usage share reads remainingFraction from amount (omp's real shape)", function()
 	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "glm-5.3-flash", state = "working", cwd = "/tmp" } }
 	load_window_plugin(t)
 	-- the shape `omp usage --json` emits: the share lives under `amount`
-	t.reads["/home/test/.omp/cache/statusline.json"] = t.json._encode({
+	t.reads[CACHE_PATH] = t.json._encode({
 		generatedAt = 1_000_000,
 		providers = {
 			{
@@ -354,6 +411,7 @@ test("usage share reads remainingFraction from amount (omp's real shape)", funct
 			},
 		},
 		modelProvider = "zai",
+		cwd = "/tmp",
 	})
 	t:tick(2)
 	local joined = joined_for(t)
@@ -364,9 +422,10 @@ end)
 
 test("usage bar respects configured barGlyphs", function()
 	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "glm-5.3-flash", state = "working", cwd = "/tmp" } }
 	load_window_plugin(t)
 	t.kv.store["config"] = { segments = { usage = { barGlyphs = 4 } } }
-	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 50 } })
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 50 } }, false, "/tmp")
 	t:tick(3)
 	-- the meter is the token between the window label and the share; count its codepoints
 	local meter = joined_for(t):match("%s(%S+) %d+%%") or ""
@@ -434,7 +493,7 @@ test("kube follows the session's env through the fresh cache", function()
 	t.kv.store["config"] = { segments = { kube = { strip = { "^arn:aws:eks:[^:]+:[0-9]+:cluster/" } } } }
 	-- the extension resolves kubectl inside omp (KUBECONFIG visible); Tern's own poller only
 	-- ever sees Tern's env, so its answer must lose when the cache carries a value
-	t.reads["/home/test/.omp/cache/statusline.json"] = t.json._encode({
+	t.reads[CACHE_PATH] = t.json._encode({
 		generatedAt = os.time() * 1000,
 		providers = {},
 		modelProvider = "aihub",
@@ -453,7 +512,7 @@ test("a fresh cache without kube still lets the poller fill in", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
 	-- fresh, same cwd, but the extension predates the kube field
-	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, {}, true, "/tmp")
+	t.reads[CACHE_PATH] = cache_fixture(t, {}, true, "/tmp")
 	t.process_answers["kube"] = { status = 0, stdout = "talos-default\n" }
 	load_window_plugin(t)
 	t:tick(2)
@@ -492,7 +551,7 @@ test("detail panel lists every fact", function()
 	local t = fake_tern()
 	load_window_plugin(t)
 	t.agents.blocks = { { pane = 7, model = "test/model", state = "working", cwd = "/tmp" } }
-	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } })
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, false, "/tmp")
 	t.process_answers["kube"] = { status = 0, stdout = "talos-default\n" }
 	t.fetch_answers[1] = {
 		status = 200,
@@ -531,7 +590,7 @@ test("every rendered segment clicks through to detail", function()
 	local t = fake_tern()
 	load_window_plugin(t)
 	t.agents.blocks = { { pane = 7, model = "test/model", state = "working", cwd = "/tmp" } }
-	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } })
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, false, "/tmp")
 	t.process_answers["kube"] = { status = 0, stdout = "talos-default\n" }
 	t.fetch_answers[1] = {
 		status = 200,

@@ -3,11 +3,11 @@
 --
 -- Segments (configurable order): indicator, provider, usage, context, budget, cost, memory, aws, kube.
 -- Data comes from three seams, each owned by one module:
---   agents    — `cx.agents:list()`, native: model, working/idle state, pane ids
---   cache     — the companion extension's `~/.omp/cache/statusline.json`, async via `cx.docs:read`;
---               the file is shared by every omp process, so its provider/kube fields only apply
---               when the writer's `cwd` matches the focused agent's cwd
---   process   — `tern.process.run` polls: kube context (fallback), aws profile, memory RSS
+--   agents    — `cx.agents:list()`, native: model, working/idle state, pane ids, cwd
+--   cache     — the companion extension's per-project `~/.omp/cache/statusline/<cwd>.json`,
+--               async via `cx.docs:read`; each omp session writes only its own project's file,
+--               so cross-project and cross-pane writers can never cross-apply their data
+--   process   — `tern.process.run` polls: kube context (fallback), aws profile, memory RSS (fallback)
 --
 -- BUDGET SAFETY: `tern.chrome.status` must stay under Tern's 4 ms hook budget (over budget
 -- disables every plugin timer until reload). The formatter does ZERO work: segments are prebuilt
@@ -364,6 +364,7 @@ export type Snapshot = {
 	model_provider: string?, -- the live omp session's active provider, from ctx.model
 	cache_cwd: string?, -- the cache writer's cwd; shared file, so identity = cwd match
 	cache_kube: string?, -- kubectl context resolved inside that session (env-true, incl. KUBECONFIG)
+	cache_rss: number?, -- the writer process's own RSS; memory prefers it over the largest-omp guess
 	cache_at: number?, -- when the cache was written (ms); freshness gates provider/usage precedence
 	context_pct: number?, -- composer context used, 0..100, scraped from the composer's meter
 	session_cost: string?, -- the composer bar's cost text, e.g. "$1.20"
@@ -397,10 +398,10 @@ end
 -- package walks `config.order`, calls these, and owns nothing about any one segment.
 
 -- A cache written within this window is "live" — the extension rewrites it every second. Fresh
--- alone is not identity: every omp process writes the same shared file, so the cache's
--- modelProvider only applies when its `cwd` matches the focused agent's cwd (a zai session in
--- another pane must not put its windows under an aihub pane). Without the match, the agent
--- block's spawn-time model string decides.
+-- alone is not identity: the focused project's file is read, and the data applies only when the
+-- writer's `cwd` matches the focused agent's cwd (the guard in read_cache already scopes reads,
+-- so this is the belt to its braces; an escaping divergence must hide data, not mislabel it).
+-- Without the match, the agent block's spawn-time model string decides.
 local CACHE_FRESH_MS = 15_000
 
 -- Does the fresh cache describe the session on screen? The cache file is shared by every omp
@@ -558,13 +559,21 @@ register("cost", function(snap, seg)
 	return { text = text, tone = seg.color or "muted" }
 end)
 
--- memory — the omp process's RSS: `󰍛 412M`.
+-- memory — the focused omp session's RSS: `󰍛 412M`. The cache carries the writer process's own
+-- RSS (exact, no guessing among omp processes); the largest-omp `ps` scan fills in when the cache
+-- is stale or absent, so pre-update sessions still render a value.
 register("memory", function(snap, seg)
-
-	if not snap.memory_bytes then
+	local bytes: number? = nil
+	if cache_matches(snap) and snap.cache_rss then
+		bytes = snap.cache_rss
+	end
+	if not bytes then
+		bytes = snap.memory_bytes
+	end
+	if not bytes then
 		return nil
 	end
-	return { text = "󰍛 " .. format.memory(snap.memory_bytes), tone = seg.color or "muted" }
+	return { text = "󰍛 " .. format.memory(bytes :: number), tone = seg.color or "muted" }
 end)
 
 -- aws — the login shell's AWS_PROFILE, captured by the fish poller into the snapshot: `☁ nsx`.
@@ -673,8 +682,15 @@ local function build_rows(cfg: Config, snap: Snapshot, path: string?): { Row }
 		local turns = if snap.session_turns then string.format(" · %d msgs", snap.session_turns) else ""
 		table.insert(rows, row("Session cost", snap.session_cost .. turns))
 	end
-	if snap.memory_bytes then
-		table.insert(rows, row("Memory", format.memory(snap.memory_bytes)))
+	local detail_rss: number? = nil
+	if cache_matches(snap) and snap.cache_rss then
+		detail_rss = snap.cache_rss
+	end
+	if not detail_rss then
+		detail_rss = snap.memory_bytes
+	end
+	if detail_rss then
+		table.insert(rows, row("Memory", format.memory(detail_rss :: number)))
 	end
 	local kube = snap.kube
 	if cache_matches(snap) and snap.cache_kube and snap.cache_kube ~= "" then
@@ -769,13 +785,16 @@ local AGENT_POLL_MS = 2000
 local agent_fields: { model: string?, state: "ready" | "working" | "waiting" | "exited", pane: number?, cwd: string? } = {
 	state = "exited",
 }
-local cache_fields: { providers: { Provider }, model_provider: string?, cache_at: number?, context_pct: number?, session_cost: string?, session_turns: number?, cwd: string?, kube: string? } = {
+local cache_fields: { providers: { Provider }, model_provider: string?, cache_at: number?, context_pct: number?, session_cost: string?, session_turns: number?, cwd: string?, kube: string?, rss: number? } = {
 	providers = {},
 }
 local proc_fields: { memory_bytes: number?, kube: string?, aws_profile: string? } = {}
 
 -- Forward-declared: publish rebuilds the prebuilt bar, so every data source lands visibly.
 local rebuild: () -> ()
+-- read_cache is declared with poll_cache but poll_agents kicks it the moment focus changes cwd,
+-- so a pane switch shows its own project's data without waiting out the 3 s cadence.
+local read_cache: (WindowCx?) -> ()
 
 local function publish()
 	data.publish({
@@ -788,6 +807,7 @@ local function publish()
 		model_provider = cache_fields.model_provider,
 		cache_cwd = cache_fields.cwd,
 		cache_kube = cache_fields.kube,
+		cache_rss = cache_fields.rss,
 		cache_at = cache_fields.cache_at,
 		context_pct = cache_fields.context_pct,
 		session_cost = cache_fields.session_cost,
@@ -801,6 +821,7 @@ local function publish()
 end
 
 local last_cx: WindowCx? = nil
+local last_focused_cwd: string? = nil
 
 local function poll_agents()
 	local cx = last_cx
@@ -838,19 +859,51 @@ local function poll_agents()
 		agent_fields.state = "exited"
 		agent_fields.cwd = nil
 	end
+	-- focus crossing projects swaps which cache file the next read targets; kick it now instead
+	-- of waiting out the 3 s cadence, and let the guard in read_cache drop stale in-flight reads
+	if (agent_fields.cwd or "") ~= (last_focused_cwd or "") then
+		last_focused_cwd = agent_fields.cwd
+		read_cache(cx)
+	end
 	publish()
 end
 
 local CACHE_POLL_MS = 3000
-local cache_text: string? = nil
 local config_text: string? = nil
 
--- The extension's cache: `~/.omp/cache/statusline.json` (the companion extension writes it).
-local CACHE_FILE = "/.omp/cache/statusline.json"
-local CACHE_PATH: string? = (function(): string?
+-- The extension's caches: one file per project, `~/.omp/cache/statusline/<escaped-cwd>.json`;
+-- this plugin reads the focused block's project's file. The name must match the extension's
+-- `cacheKey` byte for byte: non [A-Za-z0-9._-] become uppercase %XX over the UTF-8 bytes, names
+-- past 220 chars truncate with a length suffix (255-byte filename cap with the dir prefix).
+local CACHE_DIR_TAIL = "/.omp/cache/statusline"
+local CACHE_DIR: string? = (function(): string?
 	local home = tern.getenv("USERPROFILE") or tern.getenv("HOME")
-	return if home and home ~= "" then home .. CACHE_FILE else nil
+	return if home and home ~= "" then home .. CACHE_DIR_TAIL else nil
 end)()
+
+function cache_key(cwd: string): string
+	while #cwd > 1 and cwd:sub(-1) == "/" do
+		cwd = cwd:sub(1, -2)
+	end
+	if cwd == "" then
+		cwd = "/" -- mirrors the extension's `|| "/"`: the root's file is %2F.json, never .json
+	end
+	local esc = (cwd:gsub("[^%w%.%-%_]", function(c: string): string
+		return string.format("%%%02X", string.byte(c) or 0)
+	end)) :: string
+	if #esc > 220 then
+		esc = esc:sub(1, 200) .. "-" .. tostring(#esc)
+	end
+	return esc
+end
+
+function cache_file(cwd: string): string?
+	local dir = CACHE_DIR
+	if not dir then
+		return nil
+	end
+	return dir .. "/" .. cache_key(cwd) .. ".json"
+end
 
 local function parse_provider(value: any): Provider?
 	if type(value) ~= "table" or type(value.id) ~= "string" or type(value.label) ~= "string" then
@@ -916,40 +969,66 @@ local function parse_cache(text: string): (typeof(cache_fields), string?)
 	if type(doc.kube) == "string" and (doc.kube :: string) ~= "" then
 		kube = doc.kube
 	end
+	local rss: number? = nil
+	if type(doc.rssBytes) == "number" and (doc.rssBytes :: number) > 0 then
+		rss = doc.rssBytes
+	end
 	-- the file also refreshes config when its version bumps; a present file confirms the extension
-	return { providers = providers, model_provider = provider, cache_at = cache_at, context_pct = context, session_cost = cost, session_turns = turns, cwd = cwd, kube = kube }, nil
+	return { providers = providers, model_provider = provider, cache_at = cache_at, context_pct = context, session_cost = cost, session_turns = turns, cwd = cwd, kube = kube, rss = rss }, nil
+end
+
+-- Reads the focused project's cache. cache_fields only ever holds values for the focused agent's
+-- cwd — switching focus swaps files, and a read that lands after another focus change is dropped
+-- by the cwd guard. parse_cache keeps the doc's own cwd; a mismatch with the path it came from
+-- (impossible when both sides encode identically) hides the cache rather than mislabeling it.
+function read_cache(cx: WindowCx?)
+	if cx == nil then
+		return
+	end
+	local cwd = agent_fields.cwd
+	local path = if cwd and cwd ~= "" then cache_file(cwd) else nil
+	if not path then
+		-- no focused agent: drop stale cache-driven segments instead of showing another project's
+		if next(cache_fields.providers) ~= nil or cache_fields.model_provider or cache_fields.kube or cache_fields.rss or cache_fields.cache_at then
+			cache_fields = { providers = {} }
+			publish()
+			chrome.refresh()
+		end
+		return
+	end
+	local ok, reading = pcall(function(): any
+		return (cx :: WindowCx).docs:read(path :: string)
+	end)
+	if not ok or reading == nil then
+		return
+	end
+	(reading :: any):next(function(text: string?, _err: string?)
+		if agent_fields.cwd ~= cwd then
+			return -- focus moved on while this read was in flight
+		end
+		if text == nil or type(text) ~= "string" then
+			return
+		end
+		local fields = parse_cache(text :: string)
+		-- strict: a doc without its own cwd is an old-shape file that cannot be scoped to any
+		-- project, so it must be hidden, not applied
+		if (fields.cwd or "") ~= (cwd or "") then
+			return -- wrong project, or an old-shape file with no cwd at all
+		end
+		cache_fields = fields
+		publish()
+		chrome.refresh()
+	end)
 end
 
 local function poll_cache(cx: WindowCx?)
 	tern.timer(CACHE_POLL_MS, poll_cache)
-	if cx == nil then
-		return
-	end
-	local read = function(path: string?): any
-		if path == nil then
-			return nil
-		end
-		local ok, reading = pcall(function(): any
-			return (cx :: WindowCx).docs:read(path :: string)
-		end)
-		return if ok then reading else nil
-	end
-	-- the extension's cache; a failed read (the file being replaced, or gone) keeps the last text
-	local reading = read(CACHE_PATH)
-	if reading then
+	read_cache(cx)
+	local ok, reading = pcall(function(): any
+		return (cx :: WindowCx).docs:read(config.path())
+	end)
+	if ok and reading then
 		reading:next(function(text: string?, _err: string?)
-			if text ~= nil and text ~= cache_text then
-				cache_text = text
-				cache_fields = parse_cache(text :: string)
-				publish()
-				chrome.refresh()
-			end
-		end)
-	end
-	-- the config file; its contents normalize into the kv mirror every window already reads
-	local config_reading = read(config.path())
-	if config_reading then
-		config_reading:next(function(text: string?, _err: string?)
 			if text ~= nil and text ~= config_text then
 				config_text = text
 				config.from_file(text :: string)

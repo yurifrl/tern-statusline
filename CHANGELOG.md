@@ -2,18 +2,26 @@
 
 ## Unreleased
 
+- The cache is per project, not global: the companion extension writes
+  `~/.omp/cache/statusline/<escaped-cwd>.json` (one file per session cwd, identical encoder both
+  sides) and the plugin reads the focused agent's project's file. Every omp process used to write
+  one shared `statusline.json`, so a fresh write was last-writer-wins — three home-systems sessions
+  and five other projects' sessions flipped one file's `modelProvider`/`contextPct`/cost several
+  times a second, which is the "zai bar under an aihub pane" flicker. Subagent sessions
+  (`ctx.agent.kind == "sub"`) never write; only main sessions do.
+- The extension touches only while its session works (1 s touch gated on `busy`, 30 s idle
+  keepalive), so idle panes stop stamping stale `contextPct`/cost over active ones in the same
+  project; two busy sessions in one directory still alternate at the plugin's 3 s read cadence.
+- The `memory` segment prefers the cache's `rssBytes` — the writing session's own RSS, no more
+  largest-omp-`ps` guessing; the scan stays as fallback for stale or absent caches.
 - The `kube` segment now reports the session's real context: the companion extension runs
   `kubectl config current-context` through the session cwd's mise config, so per-dir
   `[env] KUBECONFIG` (e.g. home-systems' `.mise.toml`) applies and an explicit `KUBECONFIG`
   at launch wins; Tern's own process env is never trusted while the cache is fresh. The
   process poller stays as the fallback for stale caches and older extensions.
-- The `provider` and `usage` segments stop flickering between providers: every omp process writes
-  the same shared cache file, so a fresh `modelProvider` was last-writer-wins — a zai session in
-  another pane could own an aihub pane's bar for seconds at a time. The cache now carries the
-  writer's `cwd`, and the plugin trusts provider/usage/kube fields only when the writer sits in
-  the focused agent's directory, falling back to the agent block's spawn-time model otherwise.
-- Three new behavioral scenarios: foreign-cwd cache rejection, cache-carried kube overriding the
-  poller, poller fallback when the cache predates `kube`; 21 total.
+- Six new behavioral scenarios: foreign-cwd cache rejection, unscoped (pre-cwd) docs hidden,
+  focus swaps between projects' files, cache RSS beating the ps scan, cache-carried kube
+  overriding the poller, poller fallback when the cache predates `kube`; 24 total.
 - The `aws` segment works in the GUI again: Tern's own environment lacks the login shell's exports,
   so the segment now reads `AWS_PROFILE` captured by a `fish -N -c` poller into the snapshot
   (universal vars serve it in ~30 ms) instead of `tern.getenv`, which only sees Tern's launch env.

@@ -1,32 +1,41 @@
 // statusline-cache — companion omp extension for the `tern-statusline` Tern plugin.
 //
 // The Tern plugin runs outside the omp process, so the data only omp sees (context usage, session
-// cost, message count) is written to a cache file it polls. Usage windows per provider come from
-// `omp usage --json`, the same reports omp's own usage segment shows; the plugin's settings panel
-// can show every provider at once, not just the active one.
+// cost, message count, kube context) is written to cache files it polls. Usage windows per
+// provider come from `omp usage --json`, the same reports omp's own usage segment shows; the
+// plugin's settings panel can show every provider at once, not just the active one.
 //
-// Written to ~/.omp/cache/statusline.json on session_start, after every turn, and once a
-// second (the touch tick keeps `generatedAt` fresh so the Tern plugin can trust
-// `modelProvider` across /model switches):
+// ONE FILE PER PROJECT: `~/.omp/cache/statusline/<escaped-cwd>.json`. Every omp session used to
+// fight over a single shared file (a `zai` pane in another project overwrote the aihub pane's
+// provider every second — the flicker). The plugin picks the file matching the focused block's
+// cwd, so a pane only ever reads its own project's data. Same project, several sessions: they
+// still share the file — the 1 s touch runs only while a turn is streaming, idle sessions just
+// keep the file warm every 30 s, so the active session's values dominate.
+//
+// Written on session_start, turn_start/turn_end, a 1 s touch while a turn streams, and a 30 s
+// keepalive otherwise:
 //   { generatedAt, providers: [{id,label,windows:[{label,pct,reset,saved}]}],
-//     contextPct, sessionCost, sessionTurns, modelProvider, cwd, kube }
+//     contextPct, sessionCost, sessionTurns, modelProvider, cwd, kube, rssBytes }
 //
-// `cwd` and `kube` come from this session: the plugin can't know which omp process wrote a
-// shared cache file, so it gates on cwd, and kubectl runs here through the session cwd's mise
-// config — per-dir `[env] KUBECONFIG` applies, and an explicit `KUBECONFIG` at launch wins.
-// That is env-true for the session, which Tern's own process env can never be. `kube` is ""
-// when no context resolves; touch keeps the last one.
+// `kube` is resolved here, the way the session's shell sees it: kubectl runs through the session
+// cwd's mise config — per-dir `[env] KUBECONFIG` (e.g. home-systems' .mise.toml) applies, an
+// explicit `KUBECONFIG` at omp launch wins, and exported env is inherited too. Tern's own process
+// env can never see any of it. "" when no context resolves.
 //
-// Install: copy or symlink into ~/.omp/agent/extensions/ and restart omp sessions.
+// Subagent sessions (`ctx.agent.kind === "sub"`) never write — only top-level sessions own a
+// pane's status. `rssBytes` is this process's RSS so the memory segment can be exact instead of
+// "largest omp process".
+//
+// Install: loaded via its package path; restart omp sessions to pick this up.
 
 import { execFile } from "node:child_process";
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
-const CACHE_FILE = join(homedir(), ".omp", "cache", "statusline.json");
-const USAGE_MS = 60_000;
-const TOUCH_MS = 1_000; // provider touch; the Tern plugin's freshness gate is 15 s
+const CACHE_DIR = join(homedir(), ".omp", "cache", "statusline");
+const KEEPALIVE_MS = 30_000;
+const TOUCH_MS = 1_000; // busy touch; the Tern plugin's freshness gate is 15 s
 
 function ompBin() {
 	return process.env.OMP_BIN || process.env.OMP_PATH || "omp";
@@ -35,6 +44,23 @@ function ompBin() {
 // The GUI Tern process may not carry the user's PATH; the installed omp binary is the fallback.
 function ompPaths() {
 	return [ompBin(), `${homedir()}/Library/Application Support/Tern/omp/bin/omp`];
+}
+
+// Cache filename for a cwd — must match the plugin's `cache_key` byte for byte: non
+// [A-Za-z0-9._-] become uppercase %XX over the UTF-8 bytes, and names past 220 chars truncate
+// with a length suffix (the filename cap is 255 with the directory prefix).
+function cacheKey(cwd) {
+	const norm = String(cwd ?? "").replace(/\/+$/, "") || "/";
+	const esc = norm.replace(/[^A-Za-z0-9._-]/g, (c) => {
+		let out = "";
+		for (const byte of Buffer.from(c, "utf8")) out += "%" + byte.toString(16).toUpperCase().padStart(2, "0");
+		return out;
+	});
+	return esc.length > 220 ? esc.slice(0, 200) + "-" + esc.length : esc;
+}
+
+function cachePath(cwd) {
+	return join(CACHE_DIR, cacheKey(cwd) + ".json");
 }
 
 function fetchUsageJson() {
@@ -140,7 +166,7 @@ function providerGroups(doc) {
 	return [...groups.values()];
 }
 
-// One-word label: the first word of the id, capitalized; e.g. `zai` → `ZAI`.
+// One-word label: the first word of the id, capitalized; e.g. `zai` → `Zai`.
 function shortProvider(provider) {
 	const word = String(provider).split(/[-_.]/)[0] || String(provider);
 	return word.toUpperCase() === word ? word : word[0].toUpperCase() + word.slice(1);
@@ -176,10 +202,11 @@ function sessionSpend(ctx) {
 }
 
 function writePayload(payload) {
-	mkdirSync(dirname(CACHE_FILE), { recursive: true });
-	const tmp = `${CACHE_FILE}.tmp`;
+	mkdirSync(CACHE_DIR, { recursive: true });
+	const file = cachePath(payload.cwd);
+	const tmp = `${file}.tmp`;
 	writeFileSync(tmp, JSON.stringify(payload));
-	renameSync(tmp, CACHE_FILE); // atomic swap: readers never see a half-file
+	renameSync(tmp, file); // atomic swap: readers never see a half-file
 }
 
 let lastPayload; // the most recent full payload; the touch rewrites it with a fresh timestamp
@@ -195,6 +222,7 @@ async function writeCache(ctx) {
 		modelProvider: ctx?.model?.provider,
 		cwd: ctx?.cwd,
 		kube,
+		rssBytes: process.memoryUsage().rss,
 	};
 	lastPayload = payload;
 	// every full write refreshes `generatedAt`; identical text is a no-op on the reader side
@@ -205,10 +233,11 @@ async function writeCache(ctx) {
 	}
 }
 
-// 1 s provider touch: `ctx.model` is a live getter, so re-reading it on a fast tick catches
-// /model switches; each write bumps `generatedAt`, which is what the Tern plugin's freshness
-// gate keys on. No subprocess — it rewrites the last full payload, only the timestamp, the
-// provider and the cwd change; `kube` stays the last full fetch's value (60 s cadence).
+// 1 s touch while a turn streams: `ctx.model` is a live getter, so re-reading it on a fast tick
+// catches /model switches; each write bumps `generatedAt`, which is the Tern plugin's freshness
+// gate. No subprocess — it rewrites the last full payload; only the timestamp, provider, cwd and
+// rss change; `kube` stays the last full fetch's value. Idle sessions skip this: two idle
+// sessions in one project would trade the file every second.
 function touchCache(ctx) {
 	if (!lastPayload) return; // first full write hasn't landed; session_start's update fills it
 	try {
@@ -217,18 +246,27 @@ function touchCache(ctx) {
 			generatedAt: Date.now(),
 			modelProvider: ctx?.model?.provider,
 			cwd: ctx?.cwd,
+			rssBytes: process.memoryUsage().rss,
 		});
 	} catch {
 		// cache write failure is invisible; the plugin keeps its last good read
 	}
 }
 
+// Subagent sessions (task agents, /tan clones, eval agents) run in-process under a parent pane;
+// only top-level sessions own a pane's status.
+function isSubagent(ctx) {
+	return ctx?.agent?.kind === "sub";
+}
+
 export default function statuslineCache(pi) {
 	let writing = false;
-	let timer;
+	let keepaliveTimer;
 	let touchTimer;
 	let liveCtx;
+	let busy = false;
 	const update = async (_event, ctx) => {
+		if (isSubagent(ctx)) return;
 		if (writing) return;
 		writing = true;
 		try {
@@ -238,19 +276,22 @@ export default function statuslineCache(pi) {
 		}
 	};
 	pi.on("session_start", async (_event, ctx) => {
-		liveCtx = ctx; // ExtensionContext has no setInterval; one module timer writes the latest session's data
+		liveCtx = ctx; // ExtensionContext has no setInterval; module timers write the latest session's data
 		await update(_event, ctx);
-		if (!timer) {
-			timer = setInterval(() => {
+		if (!keepaliveTimer) {
+			// idle keepalive: keeps `generatedAt` fresh so the plugin can trust this file while
+			// nothing streams; 30 s keeps cross-session fights slow instead of second-by-second
+			keepaliveTimer = setInterval(() => {
 				void update(_event, liveCtx);
-			}, USAGE_MS);
-			timer.unref?.(); // never hold the process open (print/pipe mode)
+			}, KEEPALIVE_MS);
+			keepaliveTimer.unref?.(); // never hold the process open (print/pipe mode)
 		}
-		// 1 s provider touch (touchCache, above): no subprocess, one small write. A cd into
-		// another project changes its env (mise [env] KUBECONFIG and friends), so one full
-		// write is kicked on a cwd change; the touch itself can't run kubectl.
+		// 1 s touch only while a turn streams. A cd into another project changes its env (mise
+		// [env] KUBECONFIG and friends), so one full write is kicked on a cwd change; the touch
+		// itself can't run kubectl.
 		if (!touchTimer) {
 			touchTimer = setInterval(() => {
+				if (!busy) return;
 				touchCache(liveCtx);
 				if (liveCtx?.cwd && lastPayload?.cwd && liveCtx.cwd !== lastPayload.cwd) {
 					void update(_event, liveCtx);
@@ -259,7 +300,17 @@ export default function statuslineCache(pi) {
 			touchTimer.unref?.();
 		}
 	});
+	pi.on("turn_start", async (_event, ctx) => {
+		busy = true;
+		await update(_event, ctx);
+	});
 	pi.on("turn_end", async (_event, ctx) => {
+		busy = false;
+		await update(_event, ctx);
+	});
+	pi.on("model_changed", async (_event, ctx) => {
+		// /model while idle: the touch skips idle sessions, so a full write here keeps the
+		// provider segment following the switch instead of lagging a keepalive behind it
 		await update(_event, ctx);
 	});
 }
