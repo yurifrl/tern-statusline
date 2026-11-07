@@ -9,7 +9,12 @@
 // second (the touch tick keeps `generatedAt` fresh so the Tern plugin can trust
 // `modelProvider` across /model switches):
 //   { generatedAt, providers: [{id,label,windows:[{label,pct,reset,saved}]}],
-//     contextPct, sessionCost, sessionTurns, modelProvider }
+//     contextPct, sessionCost, sessionTurns, modelProvider, cwd, kube }
+//
+// `cwd` and `kube` come from this session: the plugin can't know which omp process wrote a
+// shared cache file, so it gates on cwd, and kubectl runs here — a child of omp inherits the
+// session's env, so `KUBECONFIG` (per-dir or per-launch overrides) is respected, which Tern's
+// own process env can't see. `kube` is "" when no context resolves; touch keeps the last one.
 //
 // Install: copy or symlink into ~/.omp/agent/extensions/ and restart omp sessions.
 
@@ -45,6 +50,28 @@ function fetchUsageJson() {
 				} catch {
 					attempt(index + 1);
 				}
+			});
+		};
+		attempt(0);
+	});
+}
+
+// Current kubectl context. Runs as a child of omp, so the session's env — `KUBECONFIG`,
+// direnv, whatever the user launched with — is inherited; that is the point: Tern's own
+// process env never sees it. "" on failure so the cache can say "no context here".
+function fetchKubeContext() {
+	const argv = ["config", "current-context"];
+	const opts = { timeout: 5_000 };
+	// same PATH gap as omp itself: the GUI Tern process may not carry the user's PATH, and
+	// kubectl commonly resolves through mise's shimmed installs
+	const paths = ["kubectl", `${homedir()}/.local/share/mise/installs/kubectl/latest/kubectl`];
+	return new Promise((resolve) => {
+		const attempt = (index) => {
+			if (index >= paths.length) return resolve("");
+			execFile(paths[index], argv, opts, (err, stdout) => {
+				const context = err ? "" : stdout.toString("utf8").trim();
+				if (context) return resolve(context);
+				attempt(index + 1);
 			});
 		};
 		attempt(0);
@@ -144,7 +171,7 @@ function writePayload(payload) {
 let lastPayload; // the most recent full payload; the touch rewrites it with a fresh timestamp
 
 async function writeCache(ctx) {
-	const [doc, spend] = [await fetchUsageJson(), sessionSpend(ctx)];
+	const [doc, spend, kube] = [await fetchUsageJson(), sessionSpend(ctx), await fetchKubeContext()];
 	const payload = {
 		generatedAt: Date.now(),
 		providers: providerGroups(doc),
@@ -152,6 +179,8 @@ async function writeCache(ctx) {
 		sessionCost: spend.total > 0 ? `$${spend.total.toFixed(2)}` : "$0.00",
 		sessionTurns: spend.turns,
 		modelProvider: ctx?.model?.provider,
+		cwd: ctx?.cwd,
+		kube,
 	};
 	lastPayload = payload;
 	// every full write refreshes `generatedAt`; identical text is a no-op on the reader side
@@ -164,12 +193,17 @@ async function writeCache(ctx) {
 
 // 1 s provider touch: `ctx.model` is a live getter, so re-reading it on a fast tick catches
 // /model switches; each write bumps `generatedAt`, which is what the Tern plugin's freshness
-// gate keys on. No subprocess — it rewrites the last full payload, only the timestamp and the
-// provider change. Unchanged fields cost one small file write per second.
+// gate keys on. No subprocess — it rewrites the last full payload, only the timestamp, the
+// provider and the cwd change; `kube` stays the last full fetch's value (60 s cadence).
 function touchCache(ctx) {
 	if (!lastPayload) return; // first full write hasn't landed; session_start's update fills it
 	try {
-		writePayload({ ...lastPayload, generatedAt: Date.now(), modelProvider: ctx?.model?.provider });
+		writePayload({
+			...lastPayload,
+			generatedAt: Date.now(),
+			modelProvider: ctx?.model?.provider,
+			cwd: ctx?.cwd,
+		});
 	} catch {
 		// cache write failure is invisible; the plugin keeps its last good read
 	}

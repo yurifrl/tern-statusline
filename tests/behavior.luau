@@ -205,7 +205,9 @@ end
 
 -- A statusline cache the companion extension would have written. `now` makes it just-written
 -- (the live modelProvider the plugin trusts); the default is an old file it must not trust.
-local function cache_fixture(t: any, windows: { any }, now: boolean?): string
+-- `cwd` is the extension's new payload field — the writer's session cwd, which the plugin
+-- gates on; omit it to model an extension that predates the field.
+local function cache_fixture(t: any, windows: { any }, now: boolean?, cwd: string?): string
 	return t.json._encode({
 		generatedAt = if now then os.time() * 1000 else 1_000_000,
 		providers = {
@@ -219,6 +221,7 @@ local function cache_fixture(t: any, windows: { any }, now: boolean?): string
 		sessionCost = "$1.20",
 		sessionTurns = 3,
 		modelProvider = "zai",
+		cwd = cwd,
 	})
 end
 
@@ -268,12 +271,23 @@ end)
 test("a fresh cache's modelProvider beats the agent block's spawn-time model", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
-	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } }, true)
+	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/tmp")
 	load_window_plugin(t)
 	t:tick(2)
 	local joined = joined_for(t)
 	assert(joined:find("zai", 1, true) ~= nil, "live provider shows after a /model switch: " .. joined)
 	assert(joined:find("ZAI 5H", 1, true) ~= nil, "usage follows the live provider too: " .. joined)
+end)
+
+test("a fresh cache from another cwd doesn't hijack the focused pane", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/elsewhere")
+	load_window_plugin(t)
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("aihub", 1, true) ~= nil, "agent's own model shows when the writer is elsewhere: " .. joined)
+	assert(joined:find("ZAI 5H", 1, true) == nil, "another writer's usage windows stay hidden: " .. joined)
 end)
 
 test("a stale cache keeps the agent block's model", function()
@@ -412,6 +426,39 @@ test("kube applies strip patterns from config", function()
 	t:tick(2)
 	local joined = joined_for(t)
 	assert(joined:find("⎈ talos%-default", 1, false) ~= nil, "arn prefix stripped: " .. joined)
+end)
+
+test("kube follows the session's env through the fresh cache", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.kv.store["config"] = { segments = { kube = { strip = { "^arn:aws:eks:[^:]+:[0-9]+:cluster/" } } } }
+	-- the extension resolves kubectl inside omp (KUBECONFIG visible); Tern's own poller only
+	-- ever sees Tern's env, so its answer must lose when the cache carries a value
+	t.reads["/home/test/.omp/cache/statusline.json"] = t.json._encode({
+		generatedAt = os.time() * 1000,
+		providers = {},
+		modelProvider = "aihub",
+		cwd = "/tmp",
+		kube = "arn:aws:eks:us-east-1:123:cluster/talos-default",
+	})
+	t.process_answers["kube"] = { status = 0, stdout = "arn:aws:eks:us-east-1:123:cluster/from-poller\n" }
+	load_window_plugin(t)
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("⎈ talos%-default", 1, false) ~= nil, "session-resolved kube wins: " .. joined)
+	assert(joined:find("from%-poller", 1, false) == nil, "Tern's env-blind poll loses: " .. joined)
+end)
+
+test("a fresh cache without kube still lets the poller fill in", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	-- fresh, same cwd, but the extension predates the kube field
+	t.reads["/home/test/.omp/cache/statusline.json"] = cache_fixture(t, {}, true, "/tmp")
+	t.process_answers["kube"] = { status = 0, stdout = "talos-default\n" }
+	load_window_plugin(t)
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("⎈ talos%-default", 1, false) ~= nil, "poller fills in when the cache has no kube: " .. joined)
 end)
 
 test("aws renders the fish-captured profile from the snapshot", function()

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- The `kube` segment now reports the session's real context: the companion extension runs
+  `kubectl config current-context` as a child of omp, so `KUBECONFIG` (per-dir or per-launch
+  overrides) and direnv are honored; Tern's own process env can't see them. The process poller
+  stays as the fallback for stale caches and older extensions.
+- The `provider` and `usage` segments stop flickering between providers: every omp process writes
+  the same shared cache file, so a fresh `modelProvider` was last-writer-wins — a zai session in
+  another pane could own an aihub pane's bar for seconds at a time. The cache now carries the
+  writer's `cwd`, and the plugin trusts provider/usage/kube fields only when the writer sits in
+  the focused agent's directory, falling back to the agent block's spawn-time model otherwise.
+- Three new behavioral scenarios: foreign-cwd cache rejection, cache-carried kube overriding the
+  poller, poller fallback when the cache predates `kube`; 21 total.
 - The `aws` segment works in the GUI again: Tern's own environment lacks the login shell's exports,
   so the segment now reads `AWS_PROFILE` captured by a `fish -N -c` poller into the snapshot
   (universal vars serve it in ~30 ms) instead of `tern.getenv`, which only sees Tern's launch env.

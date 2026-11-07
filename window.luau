@@ -4,8 +4,10 @@
 -- Segments (configurable order): indicator, provider, usage, context, budget, cost, memory, aws, kube.
 -- Data comes from three seams, each owned by one module:
 --   agents    — `cx.agents:list()`, native: model, working/idle state, pane ids
---   cache     — the companion extension's `~/.omp/cache/statusline.json`, async via `cx.docs:read`
---   process   — `tern.process.run` polls: kube context, aws profile, memory RSS
+--   cache     — the companion extension's `~/.omp/cache/statusline.json`, async via `cx.docs:read`;
+--               the file is shared by every omp process, so its provider/kube fields only apply
+--               when the writer's `cwd` matches the focused agent's cwd
+--   process   — `tern.process.run` polls: kube context (fallback), aws profile, memory RSS
 --
 -- BUDGET SAFETY: `tern.chrome.status` must stay under Tern's 4 ms hook budget (over budget
 -- disables every plugin timer until reload). The formatter does ZERO work: segments are prebuilt
@@ -354,11 +356,14 @@ export type Snapshot = {
 	pane: number?,
 	model: string?,
 	state: "ready" | "working" | "waiting" | "exited",
+	agent_cwd: string?, -- the focused agent block's cwd; identifies whose session is on screen
 	-- gateway (AI Hub, shared fetch)
 	budget: { spent: number, limit: number? }?,
 	-- cache (companion extension)
 	providers: { Provider },
 	model_provider: string?, -- the live omp session's active provider, from ctx.model
+	cache_cwd: string?, -- the cache writer's cwd; shared file, so identity = cwd match
+	cache_kube: string?, -- kubectl context resolved inside that session (env-true, incl. KUBECONFIG)
 	cache_at: number?, -- when the cache was written (ms); freshness gates provider/usage precedence
 	context_pct: number?, -- composer context used, 0..100, scraped from the composer's meter
 	session_cost: string?, -- the composer bar's cost text, e.g. "$1.20"
@@ -391,9 +396,26 @@ end
 -- (text, tone)`. Render is pure; missing data returns nil and the segment drops out. The chrome
 -- package walks `config.order`, calls these, and owns nothing about any one segment.
 
--- A cache written within this window is "live" — the extension rewrites it every second, so a
--- fresh modelProvider beats the agent block's spawn-time model in the provider/usage segments.
+-- A cache written within this window is "live" — the extension rewrites it every second. Fresh
+-- alone is not identity: every omp process writes the same shared file, so the cache's
+-- modelProvider only applies when its `cwd` matches the focused agent's cwd (a zai session in
+-- another pane must not put its windows under an aihub pane). Without the match, the agent
+-- block's spawn-time model string decides.
 local CACHE_FRESH_MS = 15_000
+
+-- Does the fresh cache describe the session on screen? The cache file is shared by every omp
+-- process (restored panes, background restores, this session), so a fresh `modelProvider` is
+-- only trustworthy when the writer's `cwd` matches the focused agent's cwd. Writers without
+-- a cwd field predate the extension change: no match → agent-model fallback, same as stale.
+local function cache_matches(snap: Snapshot): boolean
+	local fresh = snap.cache_at ~= nil and os.time() * 1000 - (snap.cache_at :: number) < CACHE_FRESH_MS
+	if not fresh then
+		return false
+	end
+	local cache_cwd = snap.cache_cwd
+	local agent_cwd = snap.agent_cwd
+	return cache_cwd ~= nil and cache_cwd ~= "" and agent_cwd ~= nil and agent_cwd ~= "" and cache_cwd == agent_cwd
+end
 
 local segments = {}
 
@@ -424,12 +446,11 @@ end)
 
 -- provider — the AI provider behind the active model. The companion cache's `modelProvider`
 -- (omp's live `ctx.model`) is the only source that follows /model switches, so it wins while
--- the cache is fresh (written by the extension's 1 s tick); the agent block's model string is
--- fixed at spawn and only fills in when the cache is stale or absent.
+-- the cache is fresh AND the writer sits in the focused agent's cwd (see cache_matches); the
+-- agent block's model string is fixed at spawn and otherwise fills in.
 register("provider", function(snap, seg)
-	local fresh = snap.cache_at ~= nil and os.time() * 1000 - (snap.cache_at :: number) < CACHE_FRESH_MS
 	local name: string? = nil
-	if fresh then
+	if cache_matches(snap) then
 		name = snap.model_provider
 	end
 	if not name or name == "" then
@@ -447,11 +468,11 @@ end)
 -- usage — the active provider's windows as `5H ━●── 77% 1h` groups, joined by `·`. Bars render
 -- only for the provider the active model is on (`zai/glm-…` → zai's windows; a provider without
 -- a quota endpoint, like aihub, hides the segment entirely). The fresh cache's `modelProvider`
--- leads, same precedence as the provider segment.
+-- leads when the writer is in the focused agent's cwd, same gate as the provider segment —
+-- otherwise a zai writer elsewhere kept zai's windows alive under an aihub pane.
 register("usage", function(snap, seg)
-	local fresh = snap.cache_at ~= nil and os.time() * 1000 - (snap.cache_at :: number) < CACHE_FRESH_MS
 	local active: string? = nil
-	if fresh then
+	if cache_matches(snap) then
 		active = snap.model_provider
 	end
 	if not active or active == "" then
@@ -563,13 +584,19 @@ local function strip_all(text: string, patterns: { string }): string
 	return display
 end
 
--- kube — current kubectl context, refreshed by the process poller: `⎈ talos-default`.
+-- kube — current kubectl context. The cache wins when fresh: the companion extension runs
+-- kubectl as a child of omp, so `KUBECONFIG` and direnv in the session's env are respected —
+-- Tern's own process env can't see them (same reason aws polls a login fish). The process
+-- poller fills in when the cache is stale or its writer never carried kube.
 register("kube", function(snap, seg)
-
-	if not snap.kube or snap.kube == "" then
+	local value = snap.kube
+	if cache_matches(snap) and snap.cache_kube and snap.cache_kube ~= "" then
+		value = snap.cache_kube
+	end
+	if not value or value == "" then
 		return nil
 	end
-	local display = strip_all(snap.kube, seg.strip or {})
+	local display = strip_all(value, seg.strip or {})
 	if display == "" then
 		return nil
 	end
@@ -611,9 +638,13 @@ local function build_rows(cfg: Config, snap: Snapshot, path: string?): { Row }
 	local rows: { Row } = {}
 	local model = snap.model or "—"
 	table.insert(rows, row("Model", model, "accent"))
-	local provider = if snap.model_provider and snap.model_provider ~= "" then snap.model_provider
-		elseif model ~= "—" then (model :: string):match("^[^/]+") or "—" else "—"
-	table.insert(rows, row("Provider", provider :: string, "accent"))
+	local provider: string = "—"
+	if cache_matches(snap) and snap.model_provider and snap.model_provider ~= "" then
+		provider = snap.model_provider
+	elseif model ~= "—" then
+		provider = (model :: string):match("^[^/]+") or "—"
+	end
+	table.insert(rows, row("Provider", provider, "accent"))
 	local state = snap.state
 	table.insert(rows, row("State", state, if state == "working" then "accent" elseif state == "ready" then "ok" else "muted"))
 	for _, provider in snap.providers do
@@ -645,8 +676,12 @@ local function build_rows(cfg: Config, snap: Snapshot, path: string?): { Row }
 	if snap.memory_bytes then
 		table.insert(rows, row("Memory", format.memory(snap.memory_bytes)))
 	end
-	if snap.kube then
-		table.insert(rows, row("Kube", snap.kube))
+	local kube = snap.kube
+	if cache_matches(snap) and snap.cache_kube and snap.cache_kube ~= "" then
+		kube = snap.cache_kube
+	end
+	if kube then
+		table.insert(rows, row("Kube", kube))
 	end
 	if path then
 		table.insert(rows, row("Config", path, "muted"))
@@ -731,10 +766,10 @@ end
 local AGENT_POLL_MS = 2000
 
 -- Agents and cache both feed the snapshot; each keeps its own fields and merges on publish.
-local agent_fields: { model: string?, state: "ready" | "working" | "waiting" | "exited", pane: number? } = {
+local agent_fields: { model: string?, state: "ready" | "working" | "waiting" | "exited", pane: number?, cwd: string? } = {
 	state = "exited",
 }
-local cache_fields: { providers: { Provider }, model_provider: string?, cache_at: number?, context_pct: number?, session_cost: string?, session_turns: number? } = {
+local cache_fields: { providers: { Provider }, model_provider: string?, cache_at: number?, context_pct: number?, session_cost: string?, session_turns: number?, cwd: string?, kube: string? } = {
 	providers = {},
 }
 local proc_fields: { memory_bytes: number?, kube: string?, aws_profile: string? } = {}
@@ -747,9 +782,12 @@ local function publish()
 		pane = agent_fields.pane,
 		model = agent_fields.model,
 		state = agent_fields.state,
+		agent_cwd = agent_fields.cwd,
 		budget = gateway.budget(),
 		providers = cache_fields.providers,
 		model_provider = cache_fields.model_provider,
+		cache_cwd = cache_fields.cwd,
+		cache_kube = cache_fields.kube,
 		cache_at = cache_fields.cache_at,
 		context_pct = cache_fields.context_pct,
 		session_cost = cache_fields.session_cost,
@@ -793,10 +831,12 @@ local function poll_agents()
 		agent_fields.pane = chosen.pane
 		agent_fields.model = chosen.model
 		agent_fields.state = state_of(chosen)
+		agent_fields.cwd = chosen.cwd
 	else
 		agent_fields.pane = nil
 		agent_fields.model = nil
 		agent_fields.state = "exited"
+		agent_fields.cwd = nil
 	end
 	publish()
 end
@@ -868,8 +908,16 @@ local function parse_cache(text: string): (typeof(cache_fields), string?)
 	if type(doc.generatedAt) == "number" then
 		cache_at = doc.generatedAt
 	end
+	local cwd: string? = nil
+	if type(doc.cwd) == "string" and (doc.cwd :: string) ~= "" then
+		cwd = doc.cwd
+	end
+	local kube: string? = nil
+	if type(doc.kube) == "string" and (doc.kube :: string) ~= "" then
+		kube = doc.kube
+	end
 	-- the file also refreshes config when its version bumps; a present file confirms the extension
-	return { providers = providers, model_provider = provider, cache_at = cache_at, context_pct = context, session_cost = cost, session_turns = turns }, nil
+	return { providers = providers, model_provider = provider, cache_at = cache_at, context_pct = context, session_cost = cost, session_turns = turns, cwd = cwd, kube = kube }, nil
 end
 
 local function poll_cache(cx: WindowCx?)
