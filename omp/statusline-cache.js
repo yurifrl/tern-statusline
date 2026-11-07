@@ -12,9 +12,10 @@
 //     contextPct, sessionCost, sessionTurns, modelProvider, cwd, kube }
 //
 // `cwd` and `kube` come from this session: the plugin can't know which omp process wrote a
-// shared cache file, so it gates on cwd, and kubectl runs here — a child of omp inherits the
-// session's env, so `KUBECONFIG` (per-dir or per-launch overrides) is respected, which Tern's
-// own process env can't see. `kube` is "" when no context resolves; touch keeps the last one.
+// shared cache file, so it gates on cwd, and kubectl runs here through the session cwd's mise
+// config — per-dir `[env] KUBECONFIG` applies, and an explicit `KUBECONFIG` at launch wins.
+// That is env-true for the session, which Tern's own process env can never be. `kube` is ""
+// when no context resolves; touch keeps the last one.
 //
 // Install: copy or symlink into ~/.omp/agent/extensions/ and restart omp sessions.
 
@@ -56,25 +57,38 @@ function fetchUsageJson() {
 	});
 }
 
-// Current kubectl context. Runs as a child of omp, so the session's env — `KUBECONFIG`,
-// direnv, whatever the user launched with — is inherited; that is the point: Tern's own
-// process env never sees it. "" on failure so the cache can say "no context here".
-function fetchKubeContext() {
+// Current kubectl context, resolved the way the user's shell sees it. mise first: it applies
+// the session cwd's own config — per-dir `[env] KUBECONFIG` in a project's .mise.toml
+// (home-systems) is exactly how those kubeconfigs are set — and an explicit `KUBECONFIG`
+// at omp launch wins over the dir, same as fish. Runs as a child of omp, so env the user
+// exported into the session is inherited too; Tern's own process env never sees any of it.
+// "" on failure so the cache can say "no context here".
+function fetchKubeContext(cwd) {
 	const argv = ["config", "current-context"];
 	const opts = { timeout: 5_000 };
-	// same PATH gap as omp itself: the GUI Tern process may not carry the user's PATH, and
-	// kubectl commonly resolves through mise's shimmed installs
-	const paths = ["kubectl", `${homedir()}/.local/share/mise/installs/kubectl/latest/kubectl`];
+	// mise via PATH, else the homebrew install (GUI-spawned omp has no user PATH)
+	const misePaths = ["mise", "/opt/homebrew/bin/mise"];
+	// same PATH gap: kubectl commonly resolves through mise's shimmed installs
+	const kubePaths = ["kubectl", `${homedir()}/.local/share/mise/installs/kubectl/latest/kubectl`];
 	return new Promise((resolve) => {
-		const attempt = (index) => {
-			if (index >= paths.length) return resolve("");
-			execFile(paths[index], argv, opts, (err, stdout) => {
+		const runKubectl = (index, onExhausted) => {
+			if (index >= kubePaths.length) return onExhausted();
+			execFile(kubePaths[index], argv, opts, (err, stdout) => {
 				const context = err ? "" : stdout.toString("utf8").trim();
 				if (context) return resolve(context);
-				attempt(index + 1);
+				runKubectl(index + 1, onExhausted);
 			});
 		};
-		attempt(0);
+		const runMise = (index) => {
+			if (index >= misePaths.length) return runKubectl(0, () => resolve(""));
+			execFile(misePaths[index], ["x", "--", ...argv], { ...opts, cwd }, (err, stdout) => {
+				const context = err ? "" : stdout.toString("utf8").trim();
+				if (context) return resolve(context);
+				runMise(index + 1);
+			});
+		};
+		if (cwd && !process.env.KUBECONFIG) return runMise(0);
+		runKubectl(0, () => resolve(""));
 	});
 }
 
@@ -171,7 +185,7 @@ function writePayload(payload) {
 let lastPayload; // the most recent full payload; the touch rewrites it with a fresh timestamp
 
 async function writeCache(ctx) {
-	const [doc, spend, kube] = [await fetchUsageJson(), sessionSpend(ctx), await fetchKubeContext()];
+	const [doc, spend, kube] = [await fetchUsageJson(), sessionSpend(ctx), await fetchKubeContext(ctx?.cwd)];
 	const payload = {
 		generatedAt: Date.now(),
 		providers: providerGroups(doc),
@@ -232,10 +246,15 @@ export default function statuslineCache(pi) {
 			}, USAGE_MS);
 			timer.unref?.(); // never hold the process open (print/pipe mode)
 		}
-		// 1 s provider touch (touchCache, above): no subprocess, one small write.
+		// 1 s provider touch (touchCache, above): no subprocess, one small write. A cd into
+		// another project changes its env (mise [env] KUBECONFIG and friends), so one full
+		// write is kicked on a cwd change; the touch itself can't run kubectl.
 		if (!touchTimer) {
 			touchTimer = setInterval(() => {
 				touchCache(liveCtx);
+				if (liveCtx?.cwd && lastPayload?.cwd && liveCtx.cwd !== lastPayload.cwd) {
+					void update(_event, liveCtx);
+				}
 			}, TOUCH_MS);
 			touchTimer.unref?.();
 		}
