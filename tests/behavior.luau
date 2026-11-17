@@ -248,6 +248,23 @@ test("registers a status formatter that answers agent panes only", function()
 	assert(t.status_for(fake_pane("terminal")) == nil, "terminals get none")
 end)
 
+test("claude CLI terminals get the ACP-style bar; Z.AI display names read zai", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 9, model = "Z.AI GLM-4.7", state = "working", cwd = "/tmp" } }
+	load_window_plugin(t)
+	local cli = { pane = 7, kind = "terminal", program = "c", running = { line = "c --cli", ms = 1 }, cwd = "/tmp", title = "c" }
+	local segs = t.status_for(cli)
+	assert(type(segs) == "table", "claude cli terminal gets segments")
+	t:tick(2)
+	local texts = {}
+	for _, x in t.status_for(cli) do table.insert(texts, x.text) end
+	assert(table.concat(texts, " "):find("claude", 1, true) ~= nil, "cli shows claude")
+	t.agents.blocks = { { pane = 7, model = "Z.AI GLM-4.7", state = "working", cwd = "/tmp" } }
+	t.status_for(fake_pane())
+	t:tick(2)
+	assert(joined_for(t):find("zai", 1, true) ~= nil, "display name maps to zai: " .. joined_for(t))
+end)
+
 test("hides the whole line when disabled", function()
 	local t = fake_tern()
 	load_window_plugin(t)

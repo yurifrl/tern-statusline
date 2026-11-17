@@ -419,6 +419,18 @@ local function cache_matches(snap: Snapshot): boolean
 	return cache_cwd ~= nil and cache_cwd ~= "" and agent_cwd ~= nil and agent_cwd ~= "" and cache_cwd == agent_cwd
 end
 
+-- Display names (`Z.AI GLM-4.7`) carry no `provider/` prefix; map the families we know. This
+-- beats the shared per-cwd cache, which another session in the same directory may have written.
+local function provider_of_display(model: string?): string?
+	if not model then
+		return nil
+	end
+	if model:match("^Z%.?AI") then
+		return "zai"
+	end
+	return nil
+end
+
 local segments = {}
 
 type Render = (Snapshot, SegmentConfig) -> Rendered?
@@ -457,8 +469,8 @@ register("provider", function(snap, seg)
 	if snap.acp then
 		return { text = snap.acp, tone = seg.color or "accent" }
 	end
-	local name: string? = nil
-	if cache_matches(snap) then
+	local name: string? = provider_of_display(snap.model)
+	if not name and cache_matches(snap) then
 		name = snap.model_provider
 	end
 	if not name or name == "" then
@@ -773,6 +785,18 @@ local cfg: Config = config.load()
 
 -- The last pane the status bar showed; agents and usage follow it.
 local shown_pane: number? = nil
+-- The shown pane is a plain terminal running the claude CLI (`c`, `claude`): no agent block
+-- backs it, so poll_agents must not borrow another agent's data for it.
+local shown_cli = false
+
+local function is_claude_cli(pane: any): boolean
+	if pane.kind ~= "terminal" then
+		return false
+	end
+	local line: string = (pane.running and pane.running.line) or ""
+	local program: string = pane.program or ""
+	return program == "c" or program == "claude" or line:match("^c%f[%s%z]") ~= nil or line:match("^claude%f[%s%z]") ~= nil
+end
 
 local function state_of(block: any): "ready" | "working" | "waiting" | "exited"
 	local s = block.state
@@ -857,6 +881,15 @@ local function poll_agents()
 		return cx.agents:list()
 	end)
 	if not ok or type(blocks) ~= "table" then
+		return
+	end
+	if shown_cli then
+		agent_fields.pane = shown_pane
+		agent_fields.model = nil
+		agent_fields.state = "ready"
+		agent_fields.cwd = nil
+		agent_fields.acp = "claude"
+		publish()
 		return
 	end
 	local chosen: any = nil
@@ -1215,7 +1248,8 @@ end
 
 -- 4 ms budget: return the prebuilt table, nothing else.
 tern.chrome.status(function(pane: StatusPaneInfo): { StatusSegment }?
-	if not cfg.enabled or pane.kind ~= "agent" then
+	shown_cli = cfg.enabled and is_claude_cli(pane)
+	if not cfg.enabled or (pane.kind ~= "agent" and not shown_cli) then
 		return nil
 	end
 	shown_pane = pane.pane
