@@ -272,6 +272,17 @@ test("renders provider and indicator from the agent list", function()
 	assert(joined:find("󰙨", 1, true) ~= nil, "working glyph shows: " .. joined)
 end)
 
+test("ACP agents show their own name, no indicator glyph", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "Opus 5.5", state = "working", cwd = "/tmp", program = "tern'", running = { line = "'/Applications/Tern.app/Contents/MacOS/tern' acp --resume 'claude:abc'", ms = 1 } } }
+	load_window_plugin(t)
+	t:tick(2)
+	local joined = joined_for(t)
+	assert(joined:find("claude", 1, true) ~= nil, "acp provider shows: " .. joined)
+	assert(joined:find("aihub", 1, true) == nil, "no aihub on acp: " .. joined)
+	assert(joined:find("󰙨", 1, true) == nil, "no working glyph on acp: " .. joined)
+end)
+
 test("a fresh cache's modelProvider beats the agent block's spawn-time model", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }

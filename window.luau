@@ -357,6 +357,7 @@ export type Snapshot = {
 	model: string?,
 	state: "ready" | "working" | "waiting" | "exited",
 	agent_cwd: string?, -- the focused agent block's cwd; identifies whose session is on screen
+	acp: string?, -- ACP agent name ("claude") when the focused block runs over ACP, nil for omp
 	-- gateway (AI Hub, shared fetch)
 	budget: { spent: number, limit: number? }?,
 	-- cache (companion extension)
@@ -430,6 +431,9 @@ end
 
 -- indicator — state glyph; pressure overrides working when context passes thresholds.
 register("indicator", function(snap, seg)
+	if snap.acp then
+		return nil -- Tern's own chrome already shows ACP state
+	end
 
 	local icons = seg.icons :: { [string]: string }
 	if snap.state == "working" or snap.state == "waiting" then
@@ -450,6 +454,9 @@ end)
 -- the cache is fresh AND the writer sits in the focused agent's cwd (see cache_matches); the
 -- agent block's model string is fixed at spawn and otherwise fills in.
 register("provider", function(snap, seg)
+	if snap.acp then
+		return { text = snap.acp, tone = seg.color or "accent" }
+	end
 	local name: string? = nil
 	if cache_matches(snap) then
 		name = snap.model_provider
@@ -546,7 +553,7 @@ end)
 -- cost — session spend with per-message average: `󰔛 $1.20 · ~$0.08/msg`.
 register("cost", function(snap, seg)
 
-	if not snap.session_cost or snap.session_cost == "" then
+	if snap.acp or not snap.session_cost or snap.session_cost == "" then
 		return nil
 	end
 	local text = "󰔛 " .. snap.session_cost
@@ -781,8 +788,25 @@ end
 
 local AGENT_POLL_MS = 2000
 
+-- ACP detection: `tern acp --resume 'claude:<id>'` (restored panes), `tern acp claude`, or the
+-- `c` alias (cly claude) that hides the ACP launch line. omp panes run `omp …`.
+local function acp_of(block: any): string?
+	local line: string = (block.running and block.running.line) or block.program or ""
+	if line:match("^omp%f[%s%z]") or block.program == "omp" then
+		return nil
+	end
+	local name = line:match("acp%s+%-%-resume%s+'?(%a+):") or line:match("acp%s+(%a+)")
+	if name then
+		return name
+	end
+	if block.program == "c" or line:match("^c%f[%s%z]") then
+		return "claude"
+	end
+	return nil
+end
+
 -- Agents and cache both feed the snapshot; each keeps its own fields and merges on publish.
-local agent_fields: { model: string?, state: "ready" | "working" | "waiting" | "exited", pane: number?, cwd: string? } = {
+local agent_fields: { model: string?, state: "ready" | "working" | "waiting" | "exited", pane: number?, cwd: string?, acp: string? } = {
 	state = "exited",
 }
 local cache_fields: { providers: { Provider }, model_provider: string?, cache_at: number?, context_pct: number?, session_cost: string?, session_turns: number?, cwd: string?, kube: string?, rss: number? } = {
@@ -802,6 +826,7 @@ local function publish()
 		model = agent_fields.model,
 		state = agent_fields.state,
 		agent_cwd = agent_fields.cwd,
+		acp = agent_fields.acp,
 		budget = gateway.budget(),
 		providers = cache_fields.providers,
 		model_provider = cache_fields.model_provider,
@@ -853,11 +878,13 @@ local function poll_agents()
 		agent_fields.model = chosen.model
 		agent_fields.state = state_of(chosen)
 		agent_fields.cwd = chosen.cwd
+		agent_fields.acp = acp_of(chosen)
 	else
 		agent_fields.pane = nil
 		agent_fields.model = nil
 		agent_fields.state = "exited"
 		agent_fields.cwd = nil
+		agent_fields.acp = nil
 	end
 	-- focus crossing projects swaps which cache file the next read targets; kick it now instead
 	-- of waiting out the 3 s cadence, and let the guard in read_cache drop stale in-flight reads
