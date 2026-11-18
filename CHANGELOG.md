@@ -2,11 +2,21 @@
 
 ## Unreleased
 
+- The detail panel is now a floating card: a widget click, the palette command (`omp Statusline:
+  Show / Hide Card`) or `ctrl+alt+s` toggles it in the top-right corner over the focused pane.
+  It has provider tabs from the omp cache (active provider marked), one meter row per usage window
+  (bar, share left, reset, saved resets), context and AI Hub budget bars, session cost with the
+  per-message average, kube and aws, a refresh button that re-runs every poller and an edit button
+  that opens the config file, plus a "updated … ago" footer. It follows the focused pane (omp-only
+  rows hide on ACP and claude CLI panes) and redraws while open. The card is a host block
+  (`host.luau`, `[[blocks]] id = "card"`) fed through `tern.kv`; the old full-height canvas, its
+  "values refresh when the statusline does" hint and its raw config path row are gone. The action
+  id stays `plugin.tern-statusline.detail`, so custom keybindings keep working.
 - Every segment is its own Tern widget — `tern-statusline/<id>` for `provider`, `usage`,
   `context`, `budget`, `cost`, `aws`, `kube`, named `SL <Label>` (e.g. `SL Kube`) —
   placed through the palette's `Edit widgets…`. `usage`, `context` and `budget` render as text, bar
   or ring (bar: usage share left, context used, budget spent of limit); the rest are text. Click
-  opens the detail panel; hover shows a tooltip.
+  toggles the detail card; hover shows a tooltip.
 - Widgets hide when they don't apply to the focused pane: `cost`, `usage` and `context` on omp
   agent panes only; `provider` on any agent pane or claude CLI terminal;
   `budget` only when the provider is aihub; `aws` and `kube` everywhere, plain terminals included.
@@ -29,7 +39,7 @@
 - Focus changes show the newly focused pane's data on the first frame (the shown pane used to move
   only after the agent poll, leaving the old pane's data up for up to 2 s, and a claude CLI pane's
   ACP state could stick to the next agent).
-- The `ctrl+alt+s` detail chord works: it was bound to an undefined name and never registered.
+- The `ctrl+alt+s` chord works: it was bound to an undefined name and never registered.
 - Migration: the bar is empty until widgets are placed. `statusSegments: true` brings back the
   single "Plugin segments" status formatter; `prefix` and `order` apply only to it.
 - ACP agents are detected — `tern acp --resume 'claude:<id>'` (restored panes), `tern acp claude`,

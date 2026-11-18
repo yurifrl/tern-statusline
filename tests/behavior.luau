@@ -28,10 +28,37 @@ local function fake_tern()
 	t.plugin = { id = "tern-statusline" }
 	t.now = function() return 1_000_000 end
 
-	-- view builders: nodes are inert tables in the fake; detail/settings just assemble them
+	-- view builders: nodes are inert `{k, p, c}` tables in the fake, like Tern's wire nodes
 	t.ui = {
 		el = function(tag: string, props: any, children: any)
-			return { tag = tag, props = props, children = children }
+			return { k = tag, p = props or {}, c = children }
+		end,
+		span = function(text: string, style: string?)
+			return { t = text, s = style }
+		end,
+		node = function(kind: string, props: any, children: any)
+			return { k = kind, p = props or {}, c = children }
+		end,
+		badge = function(text: string, tone: string)
+			return { k = "badge", p = { text = text, tone = tone } }
+		end,
+		col = function(children: any)
+			return { k = "col", p = {}, c = children }
+		end,
+		row = function(children: any)
+			return { k = "row", p = {}, c = children }
+		end,
+		rule = function(label: any)
+			return { k = "rule", p = { label = label } }
+		end,
+	}
+
+	-- host blocks: `tern.block.define` captures the def; `cx:new_block` instantiates it
+	t.blocks = {}
+	t.block = {
+		define = function(id: string, def: any)
+			assert(type(def.init) == "function" and type(def.view) == "function", "block needs init and view")
+			t.blocks[id] = def
 		end,
 	}
 	t.getenv = function(name)
@@ -219,6 +246,68 @@ local function fake_tern()
 			return out
 		end,
 	}
+	-- cx:new_block opens a plugin block pane in the focused pane's tab and runs the host def's init;
+	-- cx.layout floats and closes it (close fires pane_closed, like Tern)
+	t.cards = {}
+	t.floats = {}
+	t.opened = {}
+	local next_pane = 50
+	function t.new_block(kind: string, args: any, _how: any, _opts: any): number?
+		local id = kind:match("^tern%-statusline%.(.+)$")
+		local def = id and t.blocks[id]
+		if not def then
+			return nil
+		end
+		next_pane += 1
+		local pane = next_pane
+		local here = t.focused and t.panes[t.focused]
+		t.panes[pane] = { pane = pane, kind = "plugin", block = kind, tab = here and here.tab, floating = false, cwd = "", title = "omp Statusline" }
+		local bcx: any = { pane = pane, cols = 58, rows = 12, renders = 0 }
+		function bcx.render(self) self.renders += 1 end
+		function bcx.open(_self, target: string) table.insert(t.opened, target) end
+		function bcx.toast(_self, ...) end
+		local st = def.init(bcx, args or {}, nil)
+		t.cards[pane] = { def = def, st = st, cx = bcx }
+		return pane
+	end
+	t.layout = {
+		float = function(_self, pane: number, over: number?, corner: string?, opts: any)
+			local info = t.panes[pane]
+			if not info then
+				return false, "no pane"
+			end
+			info.floating = true
+			t.floats[pane] = { over = over, corner = corner, opts = opts }
+			return true, nil
+		end,
+		close = function(_self, pane: number)
+			t.panes[pane] = nil
+			t.cards[pane] = nil
+			local handler = t.actions["pane_closed"]
+			if handler then
+				handler({ pane = pane }, fake_window_cx(t))
+			end
+		end,
+		focus = function(_self, pane: number) t.focused = pane end,
+	}
+	-- The open card (there is at most one in these scenarios) and its current view.
+	function t.card()
+		for pane, entry in t.cards do
+			return pane, entry
+		end
+		return nil, nil
+	end
+	function t.card_view(): any
+		local _, entry = t.card()
+		assert(entry, "a card is open")
+		return entry.def.view(entry.st, entry.cx).main
+	end
+	function t.card_event(act: string, value: string?)
+		local _, entry = t.card()
+		assert(entry, "a card is open")
+		entry.def.event(entry.st, { ev = "action", act = act, value = value }, entry.cx)
+	end
+
 	function t.focus(self, info: any)
 		t.panes[info.pane] = info
 		t.focused = info.pane
@@ -234,7 +323,10 @@ function fake_window_cx(t)
 	return {
 		session = t.session,
 		docs = t.docs,
-		canvas = t.canvas,
+		layout = t.layout,
+		new_block = function(_self, kind: string, args: any, how: any, opts: any)
+			return t.new_block(kind, args, how, opts)
+		end,
 		agents = {
 			list = function(_self)
 				return t.agents.blocks
@@ -305,6 +397,88 @@ local function claude_cli_pane()
 end
 
 local ACP_LINE = "'/Applications/Tern.app/Contents/MacOS/tern' acp --resume 'claude:abc'"
+
+-- Both halves on one fake, as Tern runs them against one kv store: host first (it defines the
+-- card block), then the window.
+local function load_both(t: any)
+	load_host_plugin(t)
+	load_window_plugin(t)
+end
+
+-- The first node keyed `key` in a view tree, depth first.
+local function find_key(node: any, key: string): any
+	if type(node) ~= "table" then
+		return nil
+	end
+	if node.p and node.p.key == key then
+		return node
+	end
+	for _, child in node.c or {} do
+		local hit = find_key(child, key)
+		if hit then
+			return hit
+		end
+	end
+	return nil
+end
+
+-- Every key under `node` starting with `prefix`, in tree order.
+local function keys_with(node: any, prefix: string, out: { string }?): { string }
+	local acc = out or {}
+	if type(node) ~= "table" then
+		return acc
+	end
+	local key = node.p and node.p.key
+	if type(key) == "string" and key:sub(1, #prefix) == prefix then
+		table.insert(acc, key)
+	end
+	for _, child in node.c or {} do
+		keys_with(child, prefix, acc)
+	end
+	return acc
+end
+
+-- A row's text: each text node's spans run together, nodes joined by a space.
+local function text_of(node: any): string
+	local parts: { string } = {}
+	local function walk(n: any)
+		if type(n) ~= "table" then
+			return
+		end
+		if n.p then
+			if n.p.spans then
+				local joined = ""
+				for _, span in n.p.spans do
+					joined ..= span.t
+				end
+				table.insert(parts, joined)
+			end
+			if n.k == "badge" then
+				table.insert(parts, n.p.text)
+			end
+		end
+		for _, child in n.c or {} do
+			walk(child)
+		end
+	end
+	walk(node)
+	return table.concat(parts, " ")
+end
+
+local function has_kind(node: any, kind: string): boolean
+	if type(node) ~= "table" then
+		return false
+	end
+	if node.k == kind then
+		return true
+	end
+	for _, child in node.c or {} do
+		if has_kind(child, kind) then
+			return true
+		end
+	end
+	return false
+end
 
 -- ── scenarios ──
 
@@ -453,6 +627,7 @@ test("compact = true renders each segment's short form", function()
 	local usage = t.widget_for("usage", fake_pane())
 	equal(usage and usage.text, "󰊚 77%", "usage: icon and the lowest share left")
 	assert(math.abs((usage.value :: number) - 0.77) < 1e-9, "usage fill is the share left")
+	assert(usage.tone ~= "error" and usage.tone ~= "warn", "77% left is healthy, not tinted: " .. tostring(usage.tone))
 	local kube = t.widget_for("kube", fake_pane())
 	equal(kube and kube.text, "⎈", "kube: glyph only")
 	equal(kube.title, "Kube: talos-default", "the value moves to the tooltip")
@@ -753,71 +928,132 @@ test("config file lands in kv through the docs poller", function()
 	equal((t.kv.store["config"] :: any).prefix, "▍", "prefix came from the file")
 end)
 
-test("detail panel lists every fact", function()
+test("a widget click toggles the floating card open and closed", function()
 	local t = fake_tern()
-	load_window_plugin(t)
-	t.agents.blocks = { { pane = 7, model = "test/model", state = "working", cwd = "/tmp" } }
-	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, false, "/tmp")
+	t.agents.blocks = { { pane = 7, model = "zai/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/tmp")
 	t.process_answers["kube"] = { status = 0, stdout = "talos-default\n" }
-	t.fetch_answers[1] = {
-		status = 200,
-		body = t.json._encode({ daily_budget = { spent_usd = 12, limit_usd = 200 } }),
-	}
-	t:tick(3)
-	assert(type(t.commands["detail"]) == "function", "detail command registered")
+	load_both(t)
+	t:focus(fake_pane())
+	t:tick(2)
+	local view = t.widget_for("kube", fake_pane())
+	equal(view and view.command, "plugin.tern-statusline.detail", "a widget click runs the toggle")
+	assert(t.card() == nil, "no card before the click")
 
-	-- the palette command and a segment click both open the same canvas
-	local opened = false
-	t.canvas = {
-		open = function(_self, _spec: any)
-			opened = true
-			return 91, nil
-		end,
-		set = function(_self, _pane: number, _change: any) end,
-		get = function(_self, _pane: number) return nil end,
-		list = function(_self) return {} end,
-	}
 	t.commands["detail"](fake_window_cx(t))
-	assert(opened, "detail command opens a canvas")
+	local pane = t.card()
+	assert(pane ~= nil, "the click opened a card block")
+	equal(t.panes[pane].block, "tern-statusline.card", "the card is the host block")
+	assert(t.panes[pane].floating, "the card floats")
+	equal(t.floats[pane].corner, "tr", "top-right corner")
+	equal(t.floats[pane].over, 7, "over the focused pane")
+	assert(type(t.kv.store["card"]) == "table", "the window mirrored the card model")
+	assert(find_key(t.card_view(), "kube") ~= nil, "the first frame already has data")
 
-	opened = false
-	local rendered = 0
-	for _, id in WIDGET_IDS do
-		local view = t.widget_for(id, fake_pane())
-		if view then
-			rendered += 1
-			assert(view.command == "plugin.tern-statusline.detail", id .. " click opens detail: " .. tostring(view.command))
-			assert(type(view.title) == "string" and view.title ~= "", id .. " carries a tooltip")
-		end
-	end
-	assert(rendered > 0, "widgets render")
-	assert(not opened, "no open happened before the command ran")
+	t.commands["detail"](fake_window_cx(t))
+	assert(t.card() == nil, "the second click closed it")
+	assert(t.panes[pane] == nil, "its pane is gone")
 end)
 
-test("every rendered segment clicks through to detail", function()
+test("the card draws a meter row per usage window", function()
 	local t = fake_tern()
-	load_window_plugin(t)
-	t.agents.blocks = { { pane = 7, model = "test/model", state = "working", cwd = "/tmp" } }
-	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, false, "/tmp")
+	t.agents.blocks = { { pane = 7, model = "zai/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads[CACHE_PATH] = cache_fixture(t, {
+		{ label = "5H", pct = 90, reset = "1h 40m" },
+		{ label = "7D", pct = 82, reset = "4d 4h", saved = 2 },
+	}, true, "/tmp")
 	t.process_answers["kube"] = { status = 0, stdout = "talos-default\n" }
-	t.fetch_answers[1] = {
-		status = 200,
-		body = t.json._encode({ daily_budget = { spent_usd = 12, limit_usd = 200 } }),
-	}
-	t:tick(3)
-	local opened = false
-	t.canvas = {
-		open = function(_self, _spec: any)
-			opened = true
-			return 91, nil
-		end,
-		set = function(_self, _pane: number, _change: any) end,
-		get = function(_self, _pane: number) return nil end,
-		list = function(_self) return {} end,
-	}
-	-- the palette command and a segment click open the same read-only panel
+	t.process_answers["aws"] = { status = 0, stdout = "nsx\n" }
+	load_both(t)
+	t:focus(fake_pane())
+	t:tick(2)
 	t.commands["detail"](fake_window_cx(t))
-	assert(opened, "detail command opens a canvas")
+	local main = t.card_view()
+	local rows = keys_with(main, "w:")
+	equal(table.concat(rows, ","), "w:5H,w:7D", "one row per window")
+	for _, key in rows do
+		assert(has_kind(find_key(main, key), "meter"), key .. " draws a bar")
+	end
+	equal(text_of(find_key(main, "w:7D")), "7D 82% left 4d 4h +2", "label, value, reset, saved")
+	local chip = find_key(main, "btn:tab=zai")
+	assert(chip ~= nil, "a provider chip per cached provider")
+	equal(chip.p.tone, "accent", "the active provider is highlighted")
+	assert(has_kind(find_key(main, "ctx"), "meter"), "context draws a bar")
+	equal(text_of(find_key(main, "cost")), "cost $1.20 · ~$0.40/msg · 3 msgs", "session cost and average")
+	equal(text_of(find_key(main, "kube")), "kube ⎈ talos-default", "kube row")
+	equal(text_of(find_key(main, "aws")), "aws ☁ nsx", "aws row")
+	assert(find_key(main, "btn:refresh") ~= nil and find_key(main, "btn:edit") ~= nil, "toolbar")
+	assert(find_key(main, "foot") ~= nil, "updated footer")
+	assert(not text_of(main):find("/config.json", 1, true), "no raw config path row")
+end)
+
+test("omp-only card rows are absent on an ACP pane", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 9, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/tmp")
+	t.fetch_answers[1] = { status = 200, body = t.json._encode({ daily_budget = { spent_usd = 12, limit_usd = 200 } }) }
+	t.process_answers["kube"] = { status = 0, stdout = "talos-default\n" }
+	t.process_answers["aws"] = { status = 0, stdout = "nsx\n" }
+	load_both(t)
+	local acp = { pane = 12, kind = "agent", program = "c", running = { line = "c", ms = 1 }, busy = false, cwd = "/tmp", title = "c" }
+	t:focus(acp)
+	t:tick(2)
+	t.commands["detail"](fake_window_cx(t))
+	local main = t.card_view()
+	equal(#keys_with(main, "w:"), 0, "no usage windows")
+	equal(#keys_with(main, "btn:tab="), 0, "no provider tabs")
+	for _, key in { "ctx", "cost", "budget" } do
+		assert(find_key(main, key) == nil, key .. " hides on the ACP pane")
+	end
+	equal(text_of(find_key(main, "chip:provider")), "claude", "the ACP agent's provider")
+	assert(find_key(main, "kube") ~= nil and find_key(main, "aws") ~= nil, "kube and aws apply everywhere")
+end)
+
+test("the open card follows focus and redraws when data changes", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "zai/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/tmp")
+	load_both(t)
+	t:focus(fake_pane())
+	t:tick(2)
+	t.commands["detail"](fake_window_cx(t))
+	local pane, entry = t.card()
+	equal(text_of(find_key(t.card_view(), "w:5H")), "5H 90% left", "first value")
+
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 40 } }, true, "/tmp")
+	local renders = entry.cx.renders
+	t:tick(2)
+	assert(entry.cx.renders > renders, "the host re-rendered the open card")
+	equal(text_of(find_key(t.card_view(), "w:5H")), "5H 40% left", "new value")
+
+	-- clicking the card focuses it; it keeps describing the agent pane
+	t:focus(t.panes[pane :: number])
+	t:tick(2)
+	assert(find_key(t.card_view(), "w:5H") ~= nil, "focusing the card keeps the agent's rows")
+
+	t:focus(claude_cli_pane())
+	t:tick(2)
+	equal(#keys_with(t.card_view(), "w:"), 0, "a claude CLI pane drops the omp rows")
+	equal(text_of(find_key(t.card_view(), "chip:provider")), "claude", "and shows its provider")
+end)
+
+test("the card's refresh re-runs the pollers and edit opens the config file", function()
+	local t = fake_tern()
+	t.agents.blocks = { { pane = 7, model = "zai/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	load_both(t)
+	t:focus(fake_pane())
+	t:tick(2)
+	t.commands["detail"](fake_window_cx(t))
+	local before = t.fetches
+	t:tick(1)
+	local baseline = t.fetches - before
+	t.card_event("refresh")
+	equal(t.kv.store["card_refresh"], 1, "refresh request filed in kv")
+	before = t.fetches
+	t:tick(1)
+	equal(t.fetches - before, baseline + 1, "the window re-polled the gateway at once")
+	t.card_event("edit")
+	equal(t.opened[1], "/home/test/.config/tern-statusline/config.json", "edit opens the config file")
 end)
 
 test("focusing agent B shows B's data right after the focus event, no tick", function()
@@ -870,7 +1106,7 @@ test("a widget registration that raises also falls back", function()
 	assert(type(segments) == "table" and #segments > 0, "legacy bar takes over")
 end)
 
-test("the detail command registers the ctrl+alt+s chord", function()
+test("the card toggle registers the ctrl+alt+s chord", function()
 	local t = fake_tern()
 	load_window_plugin(t)
 	local def = t.command_defs["detail"]

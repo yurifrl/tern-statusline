@@ -17,9 +17,13 @@
 -- into upvalues by poll callbacks (`rebuild`, which then calls `tern.chrome.refresh`), and the
 -- formatters only record the pane and return the prebuilt value.
 --
--- Layout (packages, not sections): config · format · data · segments · chrome · detail · panel.
+-- Layout (packages, not sections): config · format · data · segments · chrome · card.
 -- Each package owns its state; cross-package calls go through the public functions listed in
 -- each header. See AGENTS.md for the rules this layout follows.
+--
+-- The detail card is a host block (`host.luau`, kind `tern-statusline.card`): Tern only lets the
+-- host half define blocks, so this half mirrors the focused pane's card model into `tern.kv`
+-- ("card") and the host block draws it; the host asks for a refresh through kv ("card_refresh").
 
 -- ── package: config ────────────────────────────────────────────────────────────
 -- Reads the config file (`~/.config/tern-statusline/config.json`, overridable via
@@ -341,6 +345,20 @@ function format.meter(pct: number, glyphs: number): string
 end
 
 -- Threshold tone: `base` unless the value crosses warnAt, then badAt.
+-- For "share left" values, where low is bad: tints at or below the thresholds.
+function format.threshold_low(value: number?, base: Tone, warnAt: number?, badAt: number?): Tone
+	if value == nil then
+		return base
+	end
+	if badAt and value <= badAt then
+		return "error"
+	end
+	if warnAt and value <= warnAt then
+		return "warn"
+	end
+	return base
+end
+
 function format.threshold(value: number?, base: Tone, warnAt: number?, badAt: number?): Tone
 	if value == nil then
 		return base
@@ -511,7 +529,9 @@ end)
 -- a quota endpoint, like aihub, hides the segment entirely). The fresh cache's `modelProvider`
 -- leads when the writer is in the focused agent's cwd, same gate as the provider segment —
 -- otherwise a zai writer elsewhere kept zai's windows alive under an aihub pane.
-register("usage", function(snap, seg)
+-- The provider whose quota windows apply: the fresh matching cache's live provider, else the
+-- agent's `provider/` model prefix, else the cache's provider. Shared with the card's tabs.
+local function active_usage(snap: Snapshot): string?
 	local active: string? = nil
 	if cache_matches(snap) then
 		active = snap.model_provider
@@ -523,6 +543,15 @@ register("usage", function(snap, seg)
 		active = snap.model_provider
 	end
 	if not active or active == "" then
+		return nil
+	end
+	return active
+end
+segments.active_usage = active_usage
+
+register("usage", function(snap, seg)
+	local active = active_usage(snap)
+	if not active then
 		return nil
 	end
 	local shown: { Provider } = {}
@@ -558,7 +587,7 @@ register("usage", function(snap, seg)
 	local text = table.concat(parts, " · ")
 	return {
 		text = text,
-		tone = format.threshold(worst, tone, seg.warnAt, seg.badAt),
+		tone = format.threshold_low(worst, tone, seg.warnAt, seg.badAt),
 		short = string.format("%s %d%%", seg.compactIcon, worst),
 		title = "Usage: " .. text,
 		value = worst / 100,
@@ -639,7 +668,7 @@ end
 -- kubectl as a child of omp, so `KUBECONFIG` and direnv in the session's env are respected —
 -- Tern's own process env can't see them (same reason aws polls a login fish). The process
 -- poller fills in when the cache is stale or its writer never carried kube.
-register("kube", function(snap, seg)
+local function kube_value(snap: Snapshot, seg: SegmentConfig): string?
 	local value = snap.kube
 	if cache_matches(snap) and snap.cache_kube and snap.cache_kube ~= "" then
 		value = snap.cache_kube
@@ -648,7 +677,13 @@ register("kube", function(snap, seg)
 		return nil
 	end
 	local display = strip_all(value, seg.strip or {})
-	if display == "" then
+	return if display == "" then nil else display
+end
+segments.kube_value = kube_value
+
+register("kube", function(snap, seg)
+	local display = kube_value(snap, seg)
+	if not display then
 		return nil
 	end
 	return { text = "⎈ " .. display, tone = seg.color or "ok", short = seg.compactIcon, title = "Kube: " .. display }
@@ -665,108 +700,6 @@ function segments.render(name: SegmentName, snap: Snapshot, seg: SegmentConfig):
 		return nil
 	end
 	return out :: Rendered
-end
-
--- ── package: detail ────────────────────────────────────────────────────────────
--- The detail view replaces the hover card of the old statusline: clicking the statusline (or the
--- palette command) opens a canvas listing every segment's full values — per-window resets, model,
--- spend math, kube context, config path.
-
-local detail = {}
-
-local DETAIL_SHEET = "statusline-detail"
-local PANEL_TITLE = "omp Statusline: Detail"
--- The detail panel's default chord (Tern chord syntax, user-rebindable).
-local PANEL_KEYS = "ctrl+alt+s"
-
--- One line per fact; segments append theirs.
-type Row = { label: string, value: string, tone: Tone? }
-
-local function row(label: string, value: string, tone: Tone?): Row
-	return { label = label, value = value, tone = tone }
-end
-
--- The view: segment rows top to bottom, then the config path and the settings hint.
-local function build_rows(cfg: Config, snap: Snapshot, path: string?): { Row }
-	local rows: { Row } = {}
-	local model = snap.model or "—"
-	table.insert(rows, row("Model", model, "accent"))
-	local provider: string = "—"
-	if cache_matches(snap) and snap.model_provider and snap.model_provider ~= "" then
-		provider = snap.model_provider
-	elseif model ~= "—" then
-		provider = (model :: string):match("^[^/]+") or "—"
-	end
-	table.insert(rows, row("Provider", provider, "accent"))
-	local state = snap.state
-	table.insert(rows, row("State", state, if state == "working" then "accent" elseif state == "ready" then "ok" else "muted"))
-	for _, provider in snap.providers do
-		for _, window in provider.windows do
-			local value = string.format("%d%% left", window.pct)
-			if window.reset and window.reset ~= "" then
-				value ..= " · resets in " .. window.reset
-			end
-			if window.saved and window.saved > 0 then
-				value ..= string.format(" · +%d saved", window.saved)
-			end
-			table.insert(rows, row(provider.label .. " " .. window.label, value))
-		end
-	end
-	if snap.context_pct then
-		table.insert(rows, row("Context", string.format("%d%% used", math.floor(snap.context_pct + 0.5))))
-	end
-	if snap.budget then
-		local value = format.usd(snap.budget.spent)
-		if snap.budget.limit then
-			value ..= " of " .. format.usd(snap.budget.limit)
-		end
-		table.insert(rows, row("Budget", value))
-	end
-	if snap.session_cost then
-		local turns = if snap.session_turns then string.format(" · %d msgs", snap.session_turns) else ""
-		table.insert(rows, row("Session cost", snap.session_cost .. turns))
-	end
-	local kube = snap.kube
-	if cache_matches(snap) and snap.cache_kube and snap.cache_kube ~= "" then
-		kube = snap.cache_kube
-	end
-	if kube then
-		table.insert(rows, row("Kube", kube))
-	end
-	if path then
-		table.insert(rows, row("Config", path, "muted"))
-	end
-	return rows
-end
-
-function detail.view(cfg: Config, snap: Snapshot, path: string?)
-	local rows = build_rows(cfg, snap, path)
-	local nodes = {}
-	for i, item in rows do
-		table.insert(nodes, (tern.ui.el("div", {
-			key = "r" .. i,
-			class = "tsl-row",
-			attrs = { ["data-tone"] = item.tone or "" },
-		}, {
-			tern.ui.el("span", { class = "tsl-label", text = item.label }),
-			tern.ui.el("span", { class = "tsl-value", text = item.value }),
-		})))
-	end
-	return tern.ui.el("div", { class = "tsl-detail" }, nodes)
-end
-
-function detail.sheet(): string
-	return [==[
-.tsl-detail { display: flex; flex-direction: column; gap: 2px; padding: 12px 16px; }
-.tsl-row { display: flex; justify-content: space-between; gap: 16px; }
-.tsl-label { font: 500 11px/18px var(--mono); color: var(--t3); }
-.tsl-value { font: 400 11.5px/18px var(--mono); font-variant-numeric: tabular-nums; color: var(--t1); white-space: nowrap; }
-.tsl-row[data-tone='accent'] .tsl-value { color: var(--accent); }
-.tsl-row[data-tone='ok'] .tsl-value { color: var(--ok); }
-.tsl-row[data-tone='warn'] .tsl-value { color: var(--warn); }
-.tsl-row[data-tone='error'] .tsl-value { color: var(--bad); }
-.tsl-row[data-tone='muted'] .tsl-value { color: var(--t3); }
-]==]
 end
 
 -- ── package: chrome ────────────────────────────────────────────────────────────
@@ -858,6 +791,8 @@ local proc_fields: { kube: string?, aws_profile: string? } = {}
 
 -- Forward-declared: publish rebuilds the prebuilt bar, so every data source lands visibly.
 local rebuild: () -> ()
+-- Forward-declared: rebuild mirrors the card model into kv while the card is open (package card).
+local card_mirror: (force: boolean?) -> ()
 -- read_cache is declared with poll_cache but poll_agents kicks it the moment focus changes cwd,
 -- so a pane switch shows its own project's data without waiting out the 3 s cadence.
 local read_cache: (WindowCx?) -> ()
@@ -1207,7 +1142,7 @@ end
 local DETAIL_ACTION = "plugin." .. tern.plugin.id .. ".detail"
 
 -- The status bar assembly: config order, hidden disabled/empty segments, prefix in front.
--- Every segment carries the detail command: a click opens the panel.
+-- Every segment carries the detail command: a click toggles the card.
 local function compose(cfg0: Config, snap: Snapshot): ({ StatusSegment }, string)
 	local out: { StatusSegment } = {}
 	local sig = {}
@@ -1382,6 +1317,7 @@ rebuild = function()
 	if changed then
 		tern.chrome.refresh()
 	end
+	card_mirror()
 end
 
 function chrome.refresh()
@@ -1392,10 +1328,18 @@ function chrome.refresh()
 	tern.chrome.refresh()
 end
 
+-- The class of the pane the card describes: the last focused pane that isn't a plugin block (the
+-- card itself takes focus when clicked, and must keep describing the pane it floats over).
+local card_class: PaneClass = "terminal"
+local CARD_KIND = tern.plugin.id .. ".card"
+
 -- Records which pane the chrome shows, so poll_agents follows it. Same rule both formatters use:
 -- only agent and claude CLI panes move `shown_pane`; a plain terminal keeps the last agent's.
 local function note_pane(pane: any): PaneClass
 	local class = pane_class(pane)
+	if pane ~= nil and pane.kind ~= "plugin" and pane.block ~= CARD_KIND then
+		card_class = class
+	end
 	if pane ~= nil then
 		shown_cli = cfg.enabled and class == "cli"
 		if class == "acp" then
@@ -1461,66 +1405,252 @@ tern.chrome.status(function(pane: StatusPaneInfo): { StatusSegment }?
 	return built
 end)
 
--- ── package: panel ─────────────────────────────────────────────────────────────
--- The config file is the single source of truth: `poll_cache` reads it every CACHE_POLL_MS and
--- `config.from_file` normalizes it; nothing in this plugin ever writes it. The detail panel is
--- read-only and lives here only because it owns the panel-pane plumbing.
+-- ── package: card ──────────────────────────────────────────────────────────────
+-- The floating detail card. Tern lets only the host half define blocks, so the block lives in
+-- `host.luau`; this package owns everything that needs the window: the toggle (find / pop up /
+-- close, like claude-usage), the card model built from the snapshot for the focused pane's class,
+-- its mirror into kv "card" (written from `rebuild` only while a card is open, only when it
+-- changed), and the refresh requests the host block files under kv "card_refresh".
+--
+-- The model is plain JSON. Applicability is decided here with the widgets' rules (`applies`), so
+-- the host draws what it gets: omp-only rows are simply absent on ACP and claude CLI panes.
 
-local panel_pane: number? = nil
+local card = {}
 
--- The detail canvas: one row per fact, opened from the statusline click or the palette.
-local function open_detail(cx: WindowCx)
-	local cfg0 = config.load()
-	local view = detail.view(cfg0, data.snapshot(), config.path())
-	local opened, err = cx.canvas:open({
-		title = PANEL_TITLE,
-		about = "Every statusline value in full, from the last snapshot.",
-		view = view,
-		dock = tern.ui.el("div", { class = "tsl-dock" }, {
-			tern.ui.el("span", { class = "tsl-hint", text = "values refresh when the statusline does" }),
-		}),
-		how = "preview",
-	})
-	if opened then
-		panel_pane = opened
-	else
-		cx:toast("error", "Cannot open detail: " .. tostring(err))
+-- The pane of the open card, so rebuild knows whether to mirror; nil when none is open.
+local card_pane: number? = nil
+local card_sig = ""
+local card_rev = 0
+-- The data clock in the footer moves in 5 s steps, so an idle card writes kv at most that often.
+local CARD_CLOCK_MS = 5000
+
+export type CardWindow = { label: string, pct: number, reset: string?, saved: number? }
+export type CardModel = {
+	rev: number,
+	class: string,
+	provider: string?,
+	model: string?,
+	active: string?,
+	providers: { { id: string, label: string, windows: { CardWindow } } },
+	context: { pct: number, warn: number?, bad: number? }?,
+	budget: { spent: number, limit: number?, warn: number?, bad: number? }?,
+	cost: { total: string, avg: string?, turns: number? }?,
+	kube: string?,
+	aws: string?,
+	usage: { warn: number?, bad: number? },
+	updated: number,
+	path: string?,
+}
+
+-- The card as a pane of `class` should see it (rows that don't apply, or lack data, are absent).
+function card.model(cfg0: Config, class: PaneClass, snap: Snapshot): CardModel
+	local seen = snapshot_for(class, snap)
+	local omp = class == "agent" and seen.acp == nil
+	local out: CardModel = {
+		rev = 0,
+		class = class,
+		providers = {},
+		usage = { warn = cfg0.segments.usage.warnAt, bad = cfg0.segments.usage.badAt },
+		updated = 0,
+		path = config.path(),
+	}
+	if applies("provider", class, seen) then
+		out.provider = segments.provider_name(seen)
+		out.model = seen.model
 	end
+	if omp then
+		out.active = segments.active_usage(seen)
+		for _, provider in seen.providers do
+			local windows: { CardWindow } = {}
+			for _, w in provider.windows do
+				table.insert(windows, { label = w.label, pct = w.pct, reset = w.reset, saved = w.saved })
+			end
+			table.insert(out.providers, { id = provider.id, label = provider.label, windows = windows })
+		end
+		if seen.context_pct then
+			local seg = cfg0.segments.context
+			out.context = { pct = seen.context_pct :: number, warn = seg.warnAt, bad = seg.badAt }
+		end
+		local cost = seen.session_cost
+		if cost and cost ~= "" then
+			local total = format.parse_usd(cost :: string)
+			local turns = seen.session_turns
+			local avg: string? = nil
+			if total and turns and turns > 1 then
+				avg = string.format("$%.2f", total / turns)
+			end
+			out.cost = { total = cost :: string, avg = avg, turns = turns }
+		end
+	end
+	if seen.budget and applies("budget", class, seen) then
+		local seg = cfg0.segments.budget
+		local budget = seen.budget :: { spent: number, limit: number? }
+		out.budget = { spent = budget.spent, limit = budget.limit, warn = seg.warnAt, bad = seg.badAt }
+	end
+	out.kube = segments.kube_value(seen, cfg0.segments.kube)
+	if seen.aws_profile and seen.aws_profile ~= "" then
+		out.aws = seen.aws_profile
+	end
+	-- the footer's "updated": the omp cache's write time on omp panes, else the last poll
+	local at = if omp and seen.cache_at then seen.cache_at :: number else snap.at
+	out.updated = at - at % CARD_CLOCK_MS
+	return out
 end
 
-local detail_sheet_installed = false
+local function model_sig(m: CardModel): string
+	local parts: { string } = {
+		m.class, m.provider or "", m.model or "", m.active or "", tostring(m.updated), m.path or "",
+		m.kube or "", m.aws or "", tostring(m.usage.warn), tostring(m.usage.bad),
+	}
+	for _, p in m.providers do
+		table.insert(parts, "p" .. p.id .. "\1" .. p.label)
+		for _, w in p.windows do
+			table.insert(parts, table.concat({ w.label, tostring(w.pct), w.reset or "", tostring(w.saved or "") }, "\1"))
+		end
+	end
+	if m.context then
+		table.insert(parts, string.format("c%.2f/%s/%s", m.context.pct, tostring(m.context.warn), tostring(m.context.bad)))
+	end
+	if m.budget then
+		table.insert(parts, string.format("b%.4f/%s/%s/%s", m.budget.spent, tostring(m.budget.limit), tostring(m.budget.warn), tostring(m.budget.bad)))
+	end
+	if m.cost then
+		table.insert(parts, "$" .. m.cost.total .. (m.cost.avg or "") .. tostring(m.cost.turns))
+	end
+	return table.concat(parts, "\n")
+end
 
--- The panel redraws itself on every focus while open; canvas:set replaces the whole view, so
--- there is no signature to diff — the 4 ms chrome formatter is the one that diffs.
-
-local function sync_panel(cx: WindowCx)
-	local pane = panel_pane
-	if pane == nil then
+-- Writes the card model when a card is open and it changed. Runs from rebuild (callbacks only).
+card_mirror = function(force: boolean?)
+	if card_pane == nil then
 		return
 	end
-	local alive = false
-	for _, info in cx.session:panes() do
-		if info.pane == pane then
-			alive = true
+	local m = card.model(cfg, card_class, data.snapshot())
+	local sig = model_sig(m)
+	if sig == card_sig and not force then
+		return
+	end
+	card_sig = sig
+	card_rev += 1
+	m.rev = card_rev
+	pcall(tern.kv.set, "card", m)
+end
+
+-- Finds the open card anywhere in this window (restored after a restart, or closed elsewhere),
+-- so mirroring follows the card that exists rather than what this VM last opened.
+function card.sync(cx: WindowCx)
+	local ok, panes = pcall(function(): any
+		return cx.session:panes()
+	end)
+	if not ok or type(panes) ~= "table" then
+		return
+	end
+	local found: number? = nil
+	for _, info in panes do
+		if info.block == CARD_KIND then
+			found = info.pane
 			break
 		end
 	end
-	if not alive then
-		panel_pane = nil
+	if found ~= card_pane then
+		card_pane = found
+		card_mirror(true)
+	end
+end
+
+-- The card in the focused pane's tab, if any (claude-usage's find_panel).
+local function find_card(cx: WindowCx): (PaneInfo?, number?)
+	local focused = cx.session:focused()
+	local here = if focused then cx.session:pane(focused) else nil
+	local tab = here and here.tab
+	for _, p in cx.session:panes() do
+		if p.block == CARD_KIND and p.tab == tab then
+			return p, focused
+		end
+	end
+	return nil, focused
+end
+
+-- Glance size in cells: wide enough for a meter row, one line per row the model will draw.
+local function card_size(m: CardModel): { number }
+	local rows = 4 -- head, rule, footer, padding
+	for _, p in m.providers do
+		if p.id == (m.active or "") then
+			rows += math.max(#p.windows, 1)
+		end
+	end
+	for _, present in { m.context ~= nil, m.budget ~= nil, m.cost ~= nil, m.kube ~= nil, m.aws ~= nil } do
+		if present then
+			rows += 1
+		end
+	end
+	return { 58, rows + 2 }
+end
+
+-- Opens the card floating in the top-right corner over the focused tiled pane.
+local function pop_up(cx: WindowCx, focused: number?)
+	local over = focused
+	local info = if over then cx.session:pane(over :: number) else nil
+	if info == nil or info.floating then
+		over = nil
+	end
+	if info and not info.floating then
+		note_pane(info)
+	end
+	-- mirror before the block starts, so its first frame already has this pane's data
+	card_pane = -1
+	card_mirror(true)
+	local pane = cx:new_block(CARD_KIND, nil, nil, { focus = false })
+	if pane == nil then
+		card_pane = nil
+		cx:toast("error", "omp Statusline: cannot open the card", "is the plugin's host half loaded?")
 		return
 	end
-	local cfg0 = config.load()
-	local snap = data.snapshot()
-	-- the pane may already be closing or owned by another plugin between the scan and the set
-	local ok, err = pcall(function()
-		cx.canvas:set(pane, {
-			view = detail.view(cfg0, snap, config.path()),
-		})
-	end)
-	if not ok then
-		panel_pane = nil
-		tern.log.warn("statusline panel: " .. tostring(err))
+	card_pane = pane
+	cx.layout:float(pane, over, "tr", { focus = false, size = card_size(card.model(cfg, card_class, data.snapshot())) })
+end
+
+-- The click / palette / chord action: open the card, close it when it floats, re-float it when the
+-- user docked it.
+function card.toggle(cx: WindowCx)
+	local panel, focused = find_card(cx)
+	if panel == nil then
+		pop_up(cx, focused)
+	elseif panel.floating then
+		cx.layout:close(panel.pane)
+		if card_pane == panel.pane then
+			card_pane = nil
+		end
+	else
+		cx.layout:float(panel.pane, nil, "tr")
+		cx.layout:focus(panel.pane)
 	end
+end
+
+function card.closed(pane: number)
+	if card_pane == pane then
+		card_pane = nil
+	end
+end
+
+-- The host block's refresh button bumps kv "card_refresh"; a change re-runs every poller now.
+local refresh_seen: any = (function(): any
+	local ok, value = pcall(tern.kv.get, "card_refresh")
+	return if ok then value else nil
+end)()
+
+local refresh_all: () -> () -- assigned in wiring, once the pollers exist
+
+function card.watch()
+	if card_pane == nil then
+		return
+	end
+	local ok, value = pcall(tern.kv.get, "card_refresh")
+	if not ok or value == refresh_seen then
+		return
+	end
+	refresh_seen = value
+	refresh_all()
 end
 
 -- ── wiring ──
@@ -1534,26 +1664,34 @@ tern.on("focus", function(ev: FocusEvent?, cx: WindowCx)
 	last_cx = cx
 	-- the focused pane leads the poll (and the cache read it kicks on a cwd change)
 	chrome.note_focus(ev, cx)
+	card.sync(cx)
 	chrome.refresh()
-	sync_panel(cx)
 end)
 
--- Palette command. The chord opens the detail panel; the config file is the only way to change
--- behavior, and the README documents every key.
-tern.command({ id = "detail", title = "omp Statusline: Detail…", icon = "gauge", keys = { PANEL_KEYS }, run = open_detail })
+-- Every poller now: the card's refresh button. The gateway, kube and aws polls answer async and
+-- publish; the cache read and agent poll publish too, so the mirror follows on its own.
+refresh_all = function()
+	poll_agents()
+	read_cache(last_cx)
+	poll_gateway()
+	poll_kube()
+	poll_aws()
+end
 
--- Panels close when their pane goes.
+-- The card toggle's default chord (Tern chord syntax, user-rebindable).
+local CARD_KEYS = "ctrl+alt+s"
+
+-- Palette command, chord and every widget click (`DETAIL_ACTION`): show / hide the card. The id
+-- stays `detail` so existing keybindings keep working.
+tern.command({ id = "detail", title = "omp Statusline: Show / Hide Card", icon = "gauge", keys = { CARD_KEYS }, run = card.toggle })
+
 tern.on("pane_closed", function(ev: { pane: number })
-	if panel_pane == ev.pane then
-		panel_pane = nil
-	end
+	card.closed(ev.pane)
 end)
 
--- Sheets: the detail view styles its own classes; the chrome sheet hides tern's built-in git
--- segment, whose branch reads twice next to the plugin's segments (no settings knob for it).
-if not detail_sheet_installed then
-	detail_sheet_installed = true
-	tern.css(DETAIL_SHEET, detail.sheet())
+-- Sheets: the chrome sheet hides tern's built-in git segment, whose branch reads twice next to the
+-- plugin's segments (no settings knob for it).
+do
 	tern.css("statusline-chrome", table.concat({
 		"footer#statusline .sl-git { display: none !important; }",
 		-- the idle run dot and the pane size carry nothing the segments don't; hiding them also
@@ -1590,6 +1728,7 @@ local function cadence(ms: number | () -> number, fn: () -> ())
 end
 
 cadence(AGENT_POLL_MS, poll_agents)
+cadence(1000, card.watch)
 cadence(GATEWAY_MS, poll_gateway)
 cadence(function() return poll_ms("kube", KUBE_MS) end, poll_kube)
 cadence(function() return poll_ms("aws", AWS_MS) end, poll_aws)

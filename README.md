@@ -2,8 +2,8 @@
 
 The omp statusline, remade for Tern: usage bars, provider, spend, AWS and kube widgets.
 
-One Tern window plugin (`window.luau`) plus one omp companion extension (`omp/`) that bridges the
-data only the omp process can see.
+One Tern plugin (`window.luau` for the widgets, `host.luau` for the detail card block) plus one omp
+companion extension (`omp/`) that bridges the data only the omp process can see.
 
 ## Install
 
@@ -33,7 +33,30 @@ widget picker. A widget hides itself when it doesn't apply to the focused pane, 
 and the claude CLI running in a terminal. Bar and ring fill with the usage share left, the context
 used, and the budget spent against its limit.
 
-Click a widget to open the detail panel; hover shows a tooltip.
+Hover shows a tooltip. Click a widget to toggle the detail card (below).
+
+## The detail card
+
+Clicking any widget, the palette command `omp Statusline: Show / Hide Card` or `ctrl+alt+s`
+(rebindable in Tern's keybindings; the action is still `plugin.tern-statusline.detail`) floats a
+card in the top-right corner over the focused pane. The same action closes it again.
+
+- **Provider tabs** — one chip per provider in the omp cache (e.g. `ZAI`, `Anthropic`); the active
+  model's provider wears a `●` and starts selected. Clicking a chip (or `tab` in the card) shows
+  that provider's windows.
+- **Usage meters** — one row per window: label, a drawn bar of the consumed share, the share left,
+  the reset countdown and saved resets: `7D ━━━━─── 82% left 4d 4h`. Tones follow
+  `segments.usage.warnAt`/`badAt` (percent left).
+- **Context** (bar), **AI Hub budget** spent/limit (bar, aihub only), **session cost** with the
+  per-message average and message count, **kube** and **aws**.
+- **Toolbar** — `↻` (or `r`) re-runs every poller now; `✎ config` (or `e`) opens
+  `~/.config/tern-statusline/config.json`.
+- **Footer** — when the data was last refreshed.
+
+The card follows the focused pane with the widgets' applicability rules: ACP agents and claude CLI
+terminals show the provider, kube and aws, never the omp-only rows; plain terminals show kube and
+aws. Focusing the card itself keeps it on the pane it describes, and it redraws while open
+whenever the data changes.
 
 ## Placing widgets
 
@@ -87,8 +110,7 @@ Every `segments.<id>` accepts:
 `timeoutMs` (process timeout, ≥ 250; default 5000).
 
 Tones cross strictly above `warnAt`/`badAt`. `barGlyphs` is the text meter's total width: bars,
-tip dot and track together. The palette command `omp Statusline: Detail…` and the `ctrl+alt+s`
-chord (rebindable in Tern's keybindings) open the same read-only detail panel a click does.
+tip dot and track together.
 
 `statusSegments: true` re-enables the old single "Plugin segments" status formatter alongside the
 widgets; `prefix` (a literal string shown first; `""` or `"none"` for nothing) and `order` apply
@@ -107,13 +129,18 @@ register widgets (`tern.chrome.widget` missing or rejecting a spec), so the bar 
   `session_start` and after every turn: provider usage windows, context percent, session cost and
   message count. It refreshes `omp usage --json` at most once a minute.
 - **Gateway budget** — `daily_budget` from the gateway renders with the shared threshold tones.
+- **The card** — Tern lets only a plugin's host half define blocks, but every value lives in the
+  window half. So the window builds the card model for the focused pane (rows that don't apply are
+  left out) and mirrors it into `tern.kv` key `card` while a card is open, only when it changed
+  (the footer clock moves in 5 s steps); the host block watches that key every second and redraws.
+  The refresh button bumps kv `card_refresh`, which the window answers by running every poller.
 
 ## Development
 
 ```sh
 bun install
-npm run check
+node scripts/check.mjs
 ```
 
-`npm run check` validates the plugin manifest, compiles both Luau sources, runs the behavioral
+`node scripts/check.mjs` validates the plugin manifest (including the `card` block), compiles both Luau sources (host and window), runs the behavioral
 scenarios inside a fake `tern` harness (`tests/behavior.luau`), and verifies the docs links.

@@ -16,20 +16,28 @@ for (const name of ['id', 'name', 'version', 'window']) {
 }
 assert.equal(field('version'), pkg.version, 'plugin.toml version matches package.json');
 assert.match(field('window'), /^[\w./-]+\.luau$/, 'window entry is a luau file');
+assert.match(field('host') ?? '', /^[\w./-]+\.luau$/, 'host entry is a luau file');
+assert.match(manifest, /^\[\[blocks\]\]\nid = "card"$/m, 'the card block is declared');
 assert.match(manifest, /^schema = 1$/m, 'schema is 1');
 const license = (await text('LICENSE')).match(/^Copyright \(c\) (\d+) /m)?.[1];
 assert.ok(license, 'LICENSE carries a copyright line');
 
 // ── luau: compiles + behavior scenarios ──
 const windowSource = await text(field('window'));
+const hostSource = await text(field('host'));
 const behaviorSource = await text('tests/behavior.luau');
 const vm = await LuauState.createAsync();
 try {
     vm.loadstring(windowSource, field('window'), true);
+    vm.loadstring(hostSource, field('host'), true);
     const run = vm.loadstring(`
 local function load_window_plugin(api)
     local tern = api
 ${windowSource}
+end
+local function load_host_plugin(api)
+    local tern = api
+${hostSource}
 end
 ${behaviorSource}
 `, 'behavior.luau', true);
