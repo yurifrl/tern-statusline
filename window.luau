@@ -1,7 +1,7 @@
 --!strict
 -- omp Statusline — the omp statusline, remade as Tern widgets.
 --
--- Segments: indicator, provider, usage, context, budget, cost, aws, kube. Each is its own
+-- Segments: provider, usage, context, budget, cost, aws, kube. Each is its own
 -- widget (`tern.chrome.widget`, id = segment name) the user places in Tern's widget bar; a widget
 -- hides (or shrinks to its compact glyph) when its segment doesn't apply to the focused pane.
 -- The old single `tern.chrome.status` formatter survives behind `statusSegments = true`.
@@ -32,10 +32,10 @@ local CONFIG_FILE = "/config.json"
 export type Tone = "muted" | "accent" | "ok" | "warn" | "error"
 
 -- Segment names, in default render order.
-export type SegmentName = "indicator" | "provider" | "usage" | "context" | "budget" | "cost" | "aws" | "kube"
+export type SegmentName = "provider" | "usage" | "context" | "budget" | "cost" | "aws" | "kube"
 
 local SEGMENT_NAMES: { SegmentName } = {
-	"indicator", "provider", "usage", "context", "budget", "cost", "aws", "kube",
+	"provider", "usage", "context", "budget", "cost", "aws", "kube",
 }
 
 -- What a widget shows when its segment doesn't apply to the focused pane (or has no data):
@@ -50,7 +50,6 @@ export type SegmentConfig = {
 	compact: boolean, -- always render the short glyph-plus-value form (per-segment, see segments)
 	compactIcon: string,
 	-- component-specific knobs; validated per segment below
-	icons: { [string]: string }?,
 	refreshMs: number?,
 	timeoutMs: number?,
 	strip: { string }?,
@@ -74,25 +73,16 @@ export type Config = {
 	enabled: boolean,
 	-- legacy single-formatter path (`tern.chrome.status`); widgets are the default surface
 	statusSegments: boolean,
-	-- "" none · "state" indicator glyph · any other string renders literally (legacy path only)
+	-- "" or "none" for none · any other string renders literally in front (legacy path only)
 	prefix: string,
 	order: { SegmentName }, -- legacy path only; widgets are placed in Tern's widget bar
 	segments: { [SegmentName]: SegmentConfig },
 	detail: { enabled: boolean },
 }
 
-local DEFAULT_ICONS: { [string]: string } = {
-	ready = "󰄾",
-	working = "󰙨",
-	refreshing = "󰔟",
-	pressure = "󰆍",
-	attention = "󰅐",
-}
-
 -- Each segment's default compact glyph: the widget's compact form and its "inapplicable = compact"
 -- placeholder. Users override per segment with `compactIcon`.
 local COMPACT_ICONS: { [SegmentName]: string } = {
-	indicator = DEFAULT_ICONS.ready,
 	provider = "󰚩",
 	usage = "󰊚",
 	context = "󰆧",
@@ -115,10 +105,9 @@ local DEFAULTS: Config = {
 	statusSegments = false,
 	prefix = "",
 	order = {
-		"indicator", "provider", "usage", "context", "budget", "cost", "aws", "kube",
+		"provider", "usage", "context", "budget", "cost", "aws", "kube",
 	},
 	segments = {
-		indicator = seg_defaults("indicator", { icons = DEFAULT_ICONS }),
 		provider = seg_defaults("provider", {}),
 		usage = seg_defaults("usage", { barGlyphs = 8, warnAt = 25, badAt = 10 }),
 		context = seg_defaults("context", { warnAt = 50, badAt = 75 }),
@@ -165,21 +154,6 @@ local function merge_segment(name: SegmentName, input: any): SegmentConfig
 	end
 	if type(input.compactIcon) == "string" and input.compactIcon ~= "" then
 		base.compactIcon = input.compactIcon
-	end
-	if base.icons then
-		-- the defaults table is shared; overrides land on a copy
-		base.icons = table.clone(base.icons :: { [string]: string })
-	end
-	if name == "indicator" and type(input.icons) == "table" then
-		for key, icon in input.icons do
-			if type(key) == "string" and type(icon) == "string" and DEFAULT_ICONS[key] then
-				(base.icons :: { [string]: string })[key] = icon
-			end
-		end
-	end
-	if name == "indicator" and base.compactIcon == COMPACT_ICONS.indicator then
-		-- without an explicit compactIcon, the indicator's compact glyph follows `icons.ready`
-		base.compactIcon = (base.icons :: { [string]: string }).ready
 	end
 	if name == "cost" and input.showZero ~= nil then
 		base.showZero = input.showZero == true
@@ -490,7 +464,6 @@ local function register(name: SegmentName, render: Render)
 end
 
 -- Compact forms (`compact = true`), per segment — the shortest text that still says something:
---   indicator  the state glyph itself (already minimal; unchanged)
 --   provider   `compactIcon` alone; the name moves to the tooltip
 --   usage      `compactIcon` + the lowest share left across the shown windows: `󰊚 77%`
 --   context    `compactIcon` + percent used: `󰆧 23%` (the full form is already this short)
@@ -498,27 +471,6 @@ end
 --   cost       `compactIcon` + session spend, no per-message average: `󰔛 $1.20`
 --   aws        `compactIcon` alone; the profile moves to the tooltip
 --   kube       `compactIcon` alone (`⎈`); the context moves to the tooltip
-
--- indicator — state glyph; pressure overrides working when context passes thresholds.
-register("indicator", function(snap, seg)
-	if snap.acp then
-		return nil -- Tern's own chrome already shows ACP state
-	end
-
-	local icons = seg.icons :: { [string]: string }
-	local title = "State: " .. snap.state
-	if snap.state == "working" or snap.state == "waiting" then
-		local ctx = snap.context_pct
-		if ctx and seg.warnAt and ctx > seg.warnAt then
-			return { text = icons.pressure, tone = if seg.badAt and ctx > seg.badAt then "error" else "warn", title = title .. " · context pressure" }
-		end
-		return { text = icons.working, tone = "accent", title = title }
-	end
-	if snap.state == "exited" then
-		return nil
-	end
-	return { text = icons.ready, tone = "ok", title = title }
-end)
 
 -- provider — the AI provider behind the active model. The companion cache's `modelProvider`
 -- (omp's live `ctx.model`) is the only source that follows /model switches, so it wins while
@@ -851,6 +803,9 @@ local shown_pane: number? = nil
 -- The shown pane is a plain terminal running the claude CLI (`c`, `claude`): no agent block
 -- backs it, so poll_agents must not borrow another agent's data for it.
 local shown_cli = false
+-- The ACP agent name the focused agent pane's own info names (`c`, `tern acp …`), when it does:
+-- agents:list may not yield a block for such a pane, so the pane info is the reliable source.
+local shown_acp: string? = nil
 
 local function is_claude_cli(pane: any): boolean
 	if pane.kind ~= "terminal" then
@@ -1282,16 +1237,15 @@ end
 --   terminal  anything else (plain shells, no pane): only agent-independent segments apply
 -- `render` classifies the pane (a field compare) and returns `views[class][name]`, nothing else.
 
-type PaneClass = "agent" | "cli" | "terminal"
+type PaneClass = "agent" | "acp" | "cli" | "terminal"
 type WidgetViewT = { text: string, tone: string?, title: string?, command: string?, value: number? }
 
-local PANE_CLASSES: { PaneClass } = { "agent", "cli", "terminal" }
+local PANE_CLASSES: { PaneClass } = { "agent", "acp", "cli", "terminal" }
 
 -- Editor tiles are narrow: each description leads with a sample of the widget, then where it
 -- applies. Tern's WidgetSpec has no preview/sample hook, so a tile on a pane where the widget
 -- doesn't apply shows only its name and this line.
 local WIDGETS: { [SegmentName]: { label: string, description: string, styles: { string } } } = {
-	indicator = { label = "Indicator", description = "omp state glyph: ready/working · omp panes", styles = { "text" } },
 	provider = { label = "Provider", description = "aihub / zai / claude · agent + claude CLI", styles = { "text" } },
 	usage = { label = "Usage", description = "5H ━━●── 50% left · omp panes", styles = { "text", "bar", "ring" } },
 	context = { label = "Context", description = "󰆧 23% context used · omp panes", styles = { "text", "bar", "ring" } },
@@ -1306,7 +1260,8 @@ local function pane_class(pane: any): PaneClass
 		return "terminal"
 	end
 	if pane.kind == "agent" then
-		return "agent"
+		-- an ACP agent pane (the `c` alias, `tern acp …`) says so in its own pane info
+		return if acp_of(pane) then "acp" else "agent"
 	end
 	if is_claude_cli(pane) then
 		return "cli"
@@ -1314,7 +1269,8 @@ local function pane_class(pane: any): PaneClass
 	return "terminal"
 end
 
--- The snapshot as each pane class should see it. A CLI pane is always the claude ACP agent; a
+-- The snapshot as each pane class should see it. A CLI pane is always the claude ACP agent; an
+-- ACP agent pane is the agent its pane info names (the matching block may be missing); a
 -- plain terminal has no agent at all, so agent-scoped cache data (kube) must not leak in.
 local function snapshot_for(class: PaneClass, snap: Snapshot): Snapshot
 	if class == "agent" then
@@ -1326,6 +1282,9 @@ local function snapshot_for(class: PaneClass, snap: Snapshot): Snapshot
 	if class == "cli" then
 		out.acp = "claude"
 		out.state = "ready"
+	elseif class == "acp" then
+		out.acp = shown_acp or snap.acp or "claude"
+		out.state = "ready"
 	else
 		out.acp = nil
 		out.state = "exited"
@@ -1336,10 +1295,10 @@ end
 -- Does segment `name` apply to a pane of `class` (seen through `snap`)? No data is decided later.
 local function applies(name: SegmentName, class: PaneClass, snap: Snapshot): boolean
 	local omp = class == "agent" and snap.acp == nil
-	if name == "indicator" or name == "cost" or name == "usage" or name == "context" then
+	if name == "cost" or name == "usage" or name == "context" then
 		return omp
 	elseif name == "provider" then
-		return class == "agent" or class == "cli"
+		return class ~= "terminal"
 	elseif name == "budget" then
 		return class == "agent" and segments.provider_name(snap) == "aihub"
 	end
@@ -1368,7 +1327,7 @@ local function widget_view(name: SegmentName, class: PaneClass, cfg0: Config, sn
 	}
 end
 
-local views: { [PaneClass]: { [SegmentName]: WidgetViewT } } = { agent = {}, cli = {}, terminal = {} }
+local views: { [PaneClass]: { [SegmentName]: WidgetViewT } } = { agent = {}, acp = {}, cli = {}, terminal = {} }
 
 -- False when `tern.chrome.widget` is missing or any registration raised: the legacy status
 -- formatter then turns on by itself, so the bar is never silently empty.
@@ -1439,6 +1398,9 @@ local function note_pane(pane: any): PaneClass
 	local class = pane_class(pane)
 	if pane ~= nil then
 		shown_cli = cfg.enabled and class == "cli"
+		if class == "acp" then
+			shown_acp = acp_of(pane)
+		end
 		if cfg.enabled and class ~= "terminal" then
 			shown_pane = pane.pane
 		end

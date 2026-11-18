@@ -285,7 +285,7 @@ end
 -- the fixtures' cwd "/tmp" the shared encoding yields %2Ftmp — these tests pin that contract.
 local CACHE_PATH = "/home/test/.omp/cache/statusline/%2Ftmp.json"
 
-local WIDGET_IDS = { "indicator", "provider", "usage", "context", "budget", "cost", "aws", "kube" }
+local WIDGET_IDS = { "provider", "usage", "context", "budget", "cost", "aws", "kube" }
 
 -- All widget texts for `pane` (default: the omp agent pane), in segment order, joined for
 -- substring assertions.
@@ -357,7 +357,7 @@ test("claude CLI terminals get the ACP-style widgets; Z.AI display names read za
 	t:tick(2)
 	local cli = joined_for(t, claude_cli_pane())
 	assert(cli:find("claude", 1, true) ~= nil, "cli shows claude: " .. cli)
-	assert(cli:find("󰙨", 1, true) == nil, "no indicator on the cli: " .. cli)
+	assert(t.widget_for("usage", claude_cli_pane()) == nil, "no omp widgets on the cli")
 	t.agents.blocks = { { pane = 7, model = "Z.AI GLM-4.7", state = "working", cwd = "/tmp" } }
 	t.widget_for("provider", fake_pane())
 	t:tick(2)
@@ -396,18 +396,18 @@ test("kube renders on a plain terminal pane, agent segments don't", function()
 	equal(kube.title, "Kube: talos-default", "kube tooltip")
 	equal(kube.command, "plugin.tern-statusline.detail", "kube clicks through to detail")
 	assert(t.widget_for("aws", term) ~= nil, "aws on a terminal")
-	for _, id in { "indicator", "provider", "usage", "context", "budget", "cost" } do
+	for _, id in { "provider", "usage", "context", "budget", "cost" } do
 		assert(t.widget_for(id, term) == nil, id .. " hides on a plain terminal")
 	end
 end)
 
-test("usage, indicator and cost hide on an ACP pane", function()
+test("usage, context and cost hide on an ACP pane", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "Opus 5.5", state = "working", cwd = "/tmp", program = "tern'", running = { line = ACP_LINE, ms = 1 } } }
 	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/tmp")
 	load_window_plugin(t)
 	t:tick(2)
-	for _, id in { "usage", "indicator", "cost", "context" } do
+	for _, id in { "usage", "cost", "context" } do
 		assert(t.widget_for(id, fake_pane()) == nil, id .. " hides on ACP")
 	end
 	local provider = t.widget_for("provider", fake_pane())
@@ -427,7 +427,7 @@ test("inapplicable = compact shows the muted compact icon on an ACP pane", funct
 	equal(usage.title, "Usage", "placeholder tooltip is the segment name")
 	local cost = t.widget_for("cost", fake_pane())
 	equal(cost and cost.text, "$", "configured compactIcon")
-	assert(t.widget_for("indicator", fake_pane()) == nil, "default inapplicable still hides")
+	assert(t.widget_for("context", fake_pane()) == nil, "default inapplicable still hides")
 end)
 
 test("bad widget config values fall back to defaults", function()
@@ -490,7 +490,7 @@ test("a data change redraws the widgets from the callback", function()
 	equal((t.widget_for("kube", fake_pane()) :: any).text, "⎈ talos-default", "new view served")
 end)
 
-test("renders provider and indicator from the agent list", function()
+test("renders the provider from the agent list", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
 	load_window_plugin(t)
@@ -498,10 +498,9 @@ test("renders provider and indicator from the agent list", function()
 	local joined = joined_for(t)
 	assert(joined:find("aihub", 1, true) ~= nil, "provider text shows: " .. joined)
 	assert(joined:find("glm%-5%.3%-flash", 1, false) == nil, "model id stays hidden: " .. joined)
-	assert(joined:find("󰙨", 1, true) ~= nil, "working glyph shows: " .. joined)
 end)
 
-test("ACP agents show their own name, no indicator glyph", function()
+test("ACP agents show their own name, no omp widgets", function()
 	local t = fake_tern()
 	t.agents.blocks = { { pane = 7, model = "Opus 5.5", state = "working", cwd = "/tmp", program = "tern'", running = { line = "'/Applications/Tern.app/Contents/MacOS/tern' acp --resume 'claude:abc'", ms = 1 } } }
 	load_window_plugin(t)
@@ -509,7 +508,7 @@ test("ACP agents show their own name, no indicator glyph", function()
 	local joined = joined_for(t)
 	assert(joined:find("claude", 1, true) ~= nil, "acp provider shows: " .. joined)
 	assert(joined:find("aihub", 1, true) == nil, "no aihub on acp: " .. joined)
-	assert(joined:find("󰙨", 1, true) == nil, "no working glyph on acp: " .. joined)
+	assert(t.widget_for("cost", fake_pane()) == nil, "no cost on acp")
 end)
 
 test("a fresh cache's modelProvider beats the agent block's spawn-time model", function()
@@ -848,7 +847,6 @@ test("focusing agent B from a claude CLI pane drops the claude ACP state", funct
 	t:focus(fake_pane("agent", 9))
 	local b = fake_pane("agent", 9)
 	equal((t.widget_for("provider", b) :: any).text, "zai", "B's own provider, not claude")
-	assert(t.widget_for("indicator", b) ~= nil, "B is an omp pane again: the indicator shows")
 end)
 
 test("missing tern.chrome.widget falls back to the status formatter", function()
@@ -909,25 +907,43 @@ test("a leftover memory section in the config is ignored", function()
 	equal(table.concat(texts, " "), "⎈ talos-default", "unknown order entries drop")
 end)
 
-test("indicator compact glyph follows icons.ready unless compactIcon is set", function()
-	local t = fake_tern()
-	t.kv.store["config"] = { segments = { indicator = { icons = { ready = "R" }, inapplicable = "compact" } } }
-	load_window_plugin(t)
-	t:tick(2)
-	equal((t.widget_for("indicator", fake_pane("terminal")) :: any).text, "R", "follows icons.ready")
-	local t2 = fake_tern()
-	t2.kv.store["config"] = { segments = { indicator = { icons = { ready = "R" }, compactIcon = "C", inapplicable = "compact" } } }
-	load_window_plugin(t2)
-	t2:tick(2)
-	equal((t2.widget_for("indicator", fake_pane("terminal")) :: any).text, "C", "explicit compactIcon wins")
-end)
-
 test("budget never shows on a claude CLI pane", function()
 	local t = fake_tern()
 	t.fetch_answers[1] = { status = 200, body = t.json._encode({ daily_budget = { spent_usd = 50, limit_usd = 200 } }) }
 	load_window_plugin(t)
 	t:tick(2)
 	assert(t.widget_for("budget", claude_cli_pane()) == nil, "no budget on the cli")
+end)
+
+test("a leftover indicator section in the config is ignored", function()
+	local t = fake_tern()
+	t.kv.store["config"] = { order = { "indicator", "kube" }, statusSegments = true, segments = { indicator = { icons = { ready = "R" }, compact = true } } }
+	t.agents.blocks = { { pane = 7, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.process_answers["kube"] = { status = 0, stdout = "talos-default\n" }
+	load_window_plugin(t)
+	t:tick(2)
+	assert(t.widgets["indicator"] == nil, "no indicator widget")
+	local texts: { string } = {}
+	for _, segment in t.status_for(fake_pane()) do
+		table.insert(texts, segment.text)
+	end
+	equal(table.concat(texts, " "), "⎈ talos-default", "unknown order entries drop")
+end)
+
+test("an ACP agent pane from the c alias reads claude without a matching agent block", function()
+	local t = fake_tern()
+	-- agents:list yields only an unrelated omp block; the focused pane is the `c` ACP agent
+	t.agents.blocks = { { pane = 9, model = "aihub/aihub/glm-5.3-flash", state = "working", cwd = "/tmp" } }
+	t.reads[CACHE_PATH] = cache_fixture(t, { { label = "5H", pct = 90 } }, true, "/tmp")
+	load_window_plugin(t)
+	local acp = { pane = 12, kind = "agent", program = "c", running = { line = "c", ms = 1 }, busy = false, cwd = "/tmp", title = "c" }
+	t:focus(acp)
+	t:tick(2)
+	local provider = t.widget_for("provider", acp)
+	equal(provider and provider.text, "claude", "provider names the ACP agent")
+	for _, id in { "usage", "cost", "context", "budget" } do
+		assert(t.widget_for(id, acp) == nil, id .. " hides on the ACP pane")
+	end
 end)
 
 return cases

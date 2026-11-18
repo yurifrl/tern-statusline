@@ -2,20 +2,25 @@
 
 ## Unreleased
 
-- Every segment is its own Tern widget — `tern-statusline/<id>` for `indicator`, `provider`,
-  `usage`, `context`, `budget`, `cost`, `aws`, `kube`, named `SL <Label>` (e.g. `SL Kube`) —
+- Every segment is its own Tern widget — `tern-statusline/<id>` for `provider`, `usage`,
+  `context`, `budget`, `cost`, `aws`, `kube`, named `SL <Label>` (e.g. `SL Kube`) —
   placed through the palette's `Edit widgets…`. `usage`, `context` and `budget` render as text, bar
   or ring (bar: usage share left, context used, budget spent of limit); the rest are text. Click
   opens the detail panel; hover shows a tooltip.
-- Widgets hide when they don't apply to the focused pane: `indicator`, `cost`, `usage` and
-  `context` on omp agent panes only; `provider` on any agent pane or claude CLI terminal;
+- Widgets hide when they don't apply to the focused pane: `cost`, `usage` and `context` on omp
+  agent panes only; `provider` on any agent pane or claude CLI terminal;
   `budget` only when the provider is aihub; `aws` and `kube` everywhere, plain terminals included.
   No data counts as not applicable.
 - New per-segment keys under `segments.<id>`: `inapplicable` (`"hide"` default, `"compact"` shows
   the muted compact icon), `compact` (always the short form: icon alone for `provider`, `aws`,
   `kube`, value in the tooltip; icon plus short value for `usage`, `context`, `budget`, `cost`),
-  `compactIcon` (the indicator's follows `icons.ready` unless set), and `enabled: false` to hide
+  `compactIcon`, and `enabled: false` to hide
   the widget entirely.
+- Removed the `indicator` segment (state glyph) and its `icons` table. A leftover
+  `segments.indicator` or `"indicator"` in `order` is ignored; `prefix` stays a literal string.
+- ACP agent panes are recognized from their own pane info (`c` alias, `tern acp …`), so the
+  provider reads `claude` and the omp-only widgets hide even when `agents:list()` yields no block
+  for the pane.
 - Removed the `memory` segment: its widget, the `ps -axo rss=,command=` poller and the plugin's use
   of the cache's `rssBytes` are gone. A leftover `segments.memory` or `"memory"` in `order` is
   ignored.
@@ -28,7 +33,7 @@
 - Migration: the bar is empty until widgets are placed. `statusSegments: true` brings back the
   single "Plugin segments" status formatter; `prefix` and `order` apply only to it.
 - ACP agents are detected — `tern acp --resume 'claude:<id>'` (restored panes), `tern acp claude`,
-  and the `c` alias — and the claude CLI in a plain terminal too: `indicator` and `cost` hide,
+  and the `c` alias — and the claude CLI in a plain terminal too: `cost` hides,
   `provider` shows the agent name (`claude`) instead of the cached aihub.
 - Z.AI display names (`Z.AI GLM-4.7`) map to the `zai` provider ahead of the per-cwd cache, which
   another session in the same directory may have written.

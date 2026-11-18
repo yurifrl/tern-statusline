@@ -21,7 +21,6 @@ widget picker. A widget hides itself when it doesn't apply to the focused pane, 
 
 | Widget | Shows | Applies on | Styles | Data source |
 | --- | --- | --- | --- | --- |
-| `indicator` | Agent state glyph: ready, working, waiting, refreshing, attention | omp agent panes | text | `cx.agents:list()` |
 | `provider` | The provider behind the agent's model — `aihub/…` reads `aihub`, Z.AI display names read `zai`, claude reads `claude` | any agent pane, claude CLI terminals | text | agent list, the cache file |
 | `usage` | Per-provider usage meter: `ZAI 5H ━━●─── 50% left` | omp agent panes | text, bar, ring | the cache file (`omp usage --json`) |
 | `context` | Composer context meter: `󰆧 23%` | omp agent panes | text, bar, ring | the cache file |
@@ -61,7 +60,6 @@ Unknown keys and bad values fall back to defaults; a corrupt file never fails to
 {
   "enabled": true,
   "segments": {
-    "indicator": { "icons": { "ready": "󰄾", "working": "󰙨" } },
     "usage": { "barGlyphs": 8, "warnAt": 25, "badAt": 10 },
     "context": { "warnAt": 50, "badAt": 75, "inapplicable": "compact" },
     "budget": { "warnAt": 50, "badAt": 75 },
@@ -72,7 +70,7 @@ Unknown keys and bad values fall back to defaults; a corrupt file never fails to
   "detail": { "enabled": true },
   "statusSegments": false,
   "prefix": "",
-  "order": ["indicator", "provider", "usage", "context", "budget", "cost", "aws", "kube"]
+  "order": ["provider", "usage", "context", "budget", "cost", "aws", "kube"]
 }
 ```
 
@@ -82,8 +80,8 @@ Every `segments.<id>` accepts:
 | --- | --- | --- |
 | `enabled` | `true` | `false` hides the widget entirely |
 | `inapplicable` | `"hide"` | `"compact"` keeps a muted compact icon where the widget doesn't apply |
-| `compact` | `false` | Always render the short form: the icon alone for `provider`, `aws`, `kube` (the value moves to the tooltip); the icon plus a short value for `usage` (`󰊚 77%`, lowest share left), `context` (`󰆧 23%`), `budget` (`󰆼 $20`, spend only), `cost` (`󰔛 $1.20`, no average); the state glyph for `indicator` |
-| `compactIcon` | per widget | The compact glyph: kube `⎈`, context `󰆧`, budget `󰆼`, cost `󰔛`, aws `` (Nerd Font `nf-fa-aws`), usage `󰊚`, provider `󰚩`, indicator follows `icons.ready` |
+| `compact` | `false` | Always render the short form: the icon alone for `provider`, `aws`, `kube` (the value moves to the tooltip); the icon plus a short value for `usage` (`󰊚 77%`, lowest share left), `context` (`󰆧 23%`), `budget` (`󰆼 $20`, spend only), `cost` (`󰔛 $1.20`, no average) |
+| `compactIcon` | per widget | The compact glyph: kube `⎈`, context `󰆧`, budget `󰆼`, cost `󰔛`, aws `` (Nerd Font `nf-fa-aws`), usage `󰊚`, provider `󰚩` |
 
 `kube` and `aws` also take `refreshMs` (poll cadence, ≥ 250; defaults 10000 and 30000) and
 `timeoutMs` (process timeout, ≥ 250; default 5000).
@@ -93,7 +91,8 @@ tip dot and track together. The palette command `omp Statusline: Detail…` and 
 chord (rebindable in Tern's keybindings) open the same read-only detail panel a click does.
 
 `statusSegments: true` re-enables the old single "Plugin segments" status formatter alongside the
-widgets; `prefix` and `order` apply only to it. It also turns on by itself when this Tern can't
+widgets; `prefix` (a literal string shown first; `""` or `"none"` for nothing) and `order` apply
+only to it. It also turns on by itself when this Tern can't
 register widgets (`tern.chrome.widget` missing or rejecting a spec), so the bar is never empty.
 
 ## How it works
