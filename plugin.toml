@@ -2,6 +2,6 @@ schema = 1
 id = "tern-statusline"
 name = "omp Statusline"
 version = "0.1.0"
-description = "The omp statusline, remade for Tern: usage bars, model, spend, memory, AWS and kube segments."
+description = "The omp statusline, remade for Tern: one widget per segment: usage, provider, context, spend, AWS and kube."
 icon = "gauge"
 window = "window.luau"

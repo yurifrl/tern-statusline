@@ -1,17 +1,21 @@
 --!strict
--- omp Statusline — the omp statusline, remade as Tern chrome segments.
+-- omp Statusline — the omp statusline, remade as Tern widgets.
 --
--- Segments (configurable order): indicator, provider, usage, context, budget, cost, memory, aws, kube.
+-- Segments: indicator, provider, usage, context, budget, cost, aws, kube. Each is its own
+-- widget (`tern.chrome.widget`, id = segment name) the user places in Tern's widget bar; a widget
+-- hides (or shrinks to its compact glyph) when its segment doesn't apply to the focused pane.
+-- The old single `tern.chrome.status` formatter survives behind `statusSegments = true`.
 -- Data comes from three seams, each owned by one module:
 --   agents    — `cx.agents:list()`, native: model, working/idle state, pane ids, cwd
 --   cache     — the companion extension's per-project `~/.omp/cache/statusline/<cwd>.json`,
 --               async via `cx.docs:read`; each omp session writes only its own project's file,
 --               so cross-project and cross-pane writers can never cross-apply their data
---   process   — `tern.process.run` polls: kube context (fallback), aws profile, memory RSS (fallback)
+--   process   — `tern.process.run` polls: kube context (fallback), aws profile
 --
--- BUDGET SAFETY: `tern.chrome.status` must stay under Tern's 4 ms hook budget (over budget
--- disables every plugin timer until reload). The formatter does ZERO work: segments are prebuilt
--- into upvalues by poll callbacks, and the formatter only returns the table.
+-- BUDGET SAFETY: widget `render` and `tern.chrome.status` must stay under Tern's 4 ms hook budget
+-- (over budget disables every plugin timer until reload). They do ZERO work: views are prebuilt
+-- into upvalues by poll callbacks (`rebuild`, which then calls `tern.chrome.refresh`), and the
+-- formatters only record the pane and return the prebuilt value.
 --
 -- Layout (packages, not sections): config · format · data · segments · chrome · detail · panel.
 -- Each package owns its state; cross-package calls go through the public functions listed in
@@ -28,15 +32,23 @@ local CONFIG_FILE = "/config.json"
 export type Tone = "muted" | "accent" | "ok" | "warn" | "error"
 
 -- Segment names, in default render order.
-export type SegmentName = "indicator" | "provider" | "usage" | "context" | "budget" | "cost" | "memory" | "aws" | "kube"
+export type SegmentName = "indicator" | "provider" | "usage" | "context" | "budget" | "cost" | "aws" | "kube"
 
 local SEGMENT_NAMES: { SegmentName } = {
-	"indicator", "provider", "usage", "context", "budget", "cost", "memory", "aws", "kube",
+	"indicator", "provider", "usage", "context", "budget", "cost", "aws", "kube",
 }
+
+-- What a widget shows when its segment doesn't apply to the focused pane (or has no data):
+-- "hide" renders nothing, "compact" renders the muted `compactIcon` alone.
+export type Inapplicable = "hide" | "compact"
 
 export type SegmentConfig = {
 	enabled: boolean,
 	color: Tone?,
+	-- widget knobs, shared by every segment
+	inapplicable: Inapplicable,
+	compact: boolean, -- always render the short glyph-plus-value form (per-segment, see segments)
+	compactIcon: string,
 	-- component-specific knobs; validated per segment below
 	icons: { [string]: string }?,
 	refreshMs: number?,
@@ -48,17 +60,23 @@ export type SegmentConfig = {
 	badAt: number?,
 }
 
--- One segment's outcome: text (nil hides the segment) and its tone.
+-- One segment's outcome: text (nil hides the segment) and its tone, plus what the widget view
+-- needs: `short` (the compact form's text), `title` (tooltip) and `value` (bar/ring fill, 0–1).
 export type Rendered = {
 	text: string,
 	tone: Tone?,
+	short: string?,
+	title: string?,
+	value: number?,
 }
 
 export type Config = {
 	enabled: boolean,
-	-- "" none · "state" indicator glyph · any other string renders literally
+	-- legacy single-formatter path (`tern.chrome.status`); widgets are the default surface
+	statusSegments: boolean,
+	-- "" none · "state" indicator glyph · any other string renders literally (legacy path only)
 	prefix: string,
-	order: { SegmentName },
+	order: { SegmentName }, -- legacy path only; widgets are placed in Tern's widget bar
 	segments: { [SegmentName]: SegmentConfig },
 	detail: { enabled: boolean },
 }
@@ -71,22 +89,43 @@ local DEFAULT_ICONS: { [string]: string } = {
 	attention = "󰅐",
 }
 
+-- Each segment's default compact glyph: the widget's compact form and its "inapplicable = compact"
+-- placeholder. Users override per segment with `compactIcon`.
+local COMPACT_ICONS: { [SegmentName]: string } = {
+	indicator = DEFAULT_ICONS.ready,
+	provider = "󰚩",
+	usage = "󰊚",
+	context = "󰆧",
+	budget = "󰆼",
+	cost = "󰔛",
+	aws = "\u{F270}", -- nf-fa-aws
+	kube = "⎈",
+}
+
+local function seg_defaults(name: SegmentName, extra: { [string]: any }): SegmentConfig
+	local seg: any = { enabled = true, inapplicable = "hide", compact = false, compactIcon = COMPACT_ICONS[name] }
+	for key, value in extra do
+		seg[key] = value
+	end
+	return seg :: SegmentConfig
+end
+
 local DEFAULTS: Config = {
 	enabled = true,
+	statusSegments = false,
 	prefix = "",
 	order = {
-		"indicator", "provider", "usage", "context", "budget", "cost", "memory", "aws", "kube",
+		"indicator", "provider", "usage", "context", "budget", "cost", "aws", "kube",
 	},
 	segments = {
-		indicator = { enabled = true, icons = DEFAULT_ICONS },
-		provider = { enabled = true },
-		usage = { enabled = true, barGlyphs = 8, warnAt = 25, badAt = 10 },
-		context = { enabled = true, warnAt = 50, badAt = 75 },
-		budget = { enabled = true, warnAt = 50, badAt = 75 },
-		cost = { enabled = true, showZero = false },
-		memory = { enabled = true, refreshMs = 10000 },
-		aws = { enabled = true },
-		kube = { enabled = true, refreshMs = 10000, timeoutMs = 5000, strip = {} },
+		indicator = seg_defaults("indicator", { icons = DEFAULT_ICONS }),
+		provider = seg_defaults("provider", {}),
+		usage = seg_defaults("usage", { barGlyphs = 8, warnAt = 25, badAt = 10 }),
+		context = seg_defaults("context", { warnAt = 50, badAt = 75 }),
+		budget = seg_defaults("budget", { warnAt = 50, badAt = 75 }),
+		cost = seg_defaults("cost", { showZero = false }),
+		aws = seg_defaults("aws", { refreshMs = 30000, timeoutMs = 5000 }),
+		kube = seg_defaults("kube", { refreshMs = 10000, timeoutMs = 5000, strip = {} }),
 	},
 	detail = { enabled = true },
 }
@@ -118,12 +157,29 @@ local function merge_segment(name: SegmentName, input: any): SegmentConfig
 	if TONES[input.color] then
 		base.color = input.color :: Tone
 	end
+	if input.inapplicable == "hide" or input.inapplicable == "compact" then
+		base.inapplicable = input.inapplicable :: Inapplicable
+	end
+	if type(input.compact) == "boolean" then
+		base.compact = input.compact
+	end
+	if type(input.compactIcon) == "string" and input.compactIcon ~= "" then
+		base.compactIcon = input.compactIcon
+	end
+	if base.icons then
+		-- the defaults table is shared; overrides land on a copy
+		base.icons = table.clone(base.icons :: { [string]: string })
+	end
 	if name == "indicator" and type(input.icons) == "table" then
 		for key, icon in input.icons do
 			if type(key) == "string" and type(icon) == "string" and DEFAULT_ICONS[key] then
 				(base.icons :: { [string]: string })[key] = icon
 			end
 		end
+	end
+	if name == "indicator" and base.compactIcon == COMPACT_ICONS.indicator then
+		-- without an explicit compactIcon, the indicator's compact glyph follows `icons.ready`
+		base.compactIcon = (base.icons :: { [string]: string }).ready
 	end
 	if name == "cost" and input.showZero ~= nil then
 		base.showZero = input.showZero == true
@@ -141,7 +197,7 @@ local function merge_segment(name: SegmentName, input: any): SegmentConfig
 		end
 	end
 	for _, key in { "refreshMs", "timeoutMs" } do
-		if type(input[key]) == "number" and (input[key] :: number) >= 250 then
+		if (name == "kube" or name == "aws") and type(input[key]) == "number" and (input[key] :: number) >= 250 then
 			local seg = base :: any
 			seg[key] = math.floor(input[key])
 		end
@@ -166,10 +222,14 @@ local function normalize(input: any): Config
 	for name, seg in DEFAULTS.segments do
 		cfg.segments[name] = table.clone(seg)
 	end
+	cfg.detail = table.clone(DEFAULTS.detail)
 	if type(input) ~= "table" then
 		return cfg
 	end
 	cfg.enabled = if input.enabled ~= nil then input.enabled == true else true
+	if type(input.statusSegments) == "boolean" then
+		cfg.statusSegments = input.statusSegments
+	end
 	if type(input.prefix) == "string" then
 		cfg.prefix = input.prefix
 	end
@@ -248,7 +308,7 @@ end
 	config.path = config_path
 
 -- ── package: format ────────────────────────────────────────────────────────────
--- Pure formatting helpers shared by every segment: counts, memory, money, time. No state, no I/O.
+-- Pure formatting helpers shared by every segment: counts, money, time. No state, no I/O.
 
 local format = {}
 
@@ -261,17 +321,6 @@ local function glyph_count(text: string): number
 	return count
 end
 format.glyph_count = glyph_count
-
--- `412M`, `1.2G` from bytes; nil passes through as "".
-function format.memory(bytes: number?): string
-	if not bytes then
-		return ""
-	end
-	if bytes >= 1024 * 1024 * 1024 then
-		return string.format("%.1fG", bytes / (1024 * 1024 * 1024))
-	end
-	return string.format("%.0fM", bytes / (1024 * 1024))
-end
 
 -- `$20`, `$1.5` from dollars.
 function format.usd(value: number): string
@@ -365,13 +414,11 @@ export type Snapshot = {
 	model_provider: string?, -- the live omp session's active provider, from ctx.model
 	cache_cwd: string?, -- the cache writer's cwd; shared file, so identity = cwd match
 	cache_kube: string?, -- kubectl context resolved inside that session (env-true, incl. KUBECONFIG)
-	cache_rss: number?, -- the writer process's own RSS; memory prefers it over the largest-omp guess
 	cache_at: number?, -- when the cache was written (ms); freshness gates provider/usage precedence
 	context_pct: number?, -- composer context used, 0..100, scraped from the composer's meter
 	session_cost: string?, -- the composer bar's cost text, e.g. "$1.20"
 	session_turns: number?, -- message count, for the average
 	-- process polls
-	memory_bytes: number?,
 	kube: string?,
 	aws_profile: string?, -- AWS_PROFILE captured from a login fish (Tern's own env lacks it)
 	at: number, -- snapshot build time, ms
@@ -394,9 +441,10 @@ function data.publish(next: Snapshot)
 end
 
 -- ── package: segments ──────────────────────────────────────────────────────────
--- One table per segment, in registry order. Each entry: `name`, `render(snapshot, seg, icons) ->
--- (text, tone)`. Render is pure; missing data returns nil and the segment drops out. The chrome
--- package walks `config.order`, calls these, and owns nothing about any one segment.
+-- One table per segment, in registry order. Each entry: `name`, `render(snapshot, seg) ->
+-- Rendered`. Render is pure; missing data returns nil and the segment drops out. The chrome
+-- package calls these per widget (and, for the legacy status formatter, in `config.order`) and
+-- owns nothing about any one segment.
 
 -- A cache written within this window is "live" — the extension rewrites it every second. Fresh
 -- alone is not identity: the focused project's file is read, and the data applies only when the
@@ -441,6 +489,16 @@ local function register(name: SegmentName, render: Render)
 	by_name[name] = render
 end
 
+-- Compact forms (`compact = true`), per segment — the shortest text that still says something:
+--   indicator  the state glyph itself (already minimal; unchanged)
+--   provider   `compactIcon` alone; the name moves to the tooltip
+--   usage      `compactIcon` + the lowest share left across the shown windows: `󰊚 77%`
+--   context    `compactIcon` + percent used: `󰆧 23%` (the full form is already this short)
+--   budget     `compactIcon` + spend, no limit: `󰆼 $20`
+--   cost       `compactIcon` + session spend, no per-message average: `󰔛 $1.20`
+--   aws        `compactIcon` alone; the profile moves to the tooltip
+--   kube       `compactIcon` alone (`⎈`); the context moves to the tooltip
+
 -- indicator — state glyph; pressure overrides working when context passes thresholds.
 register("indicator", function(snap, seg)
 	if snap.acp then
@@ -448,26 +506,28 @@ register("indicator", function(snap, seg)
 	end
 
 	local icons = seg.icons :: { [string]: string }
+	local title = "State: " .. snap.state
 	if snap.state == "working" or snap.state == "waiting" then
 		local ctx = snap.context_pct
 		if ctx and seg.warnAt and ctx > seg.warnAt then
-			return { text = icons.pressure, tone = if seg.badAt and ctx > seg.badAt then "error" else "warn" }
+			return { text = icons.pressure, tone = if seg.badAt and ctx > seg.badAt then "error" else "warn", title = title .. " · context pressure" }
 		end
-		return { text = icons.working, tone = "accent" }
+		return { text = icons.working, tone = "accent", title = title }
 	end
 	if snap.state == "exited" then
 		return nil
 	end
-	return { text = icons.ready, tone = "ok" }
+	return { text = icons.ready, tone = "ok", title = title }
 end)
 
 -- provider — the AI provider behind the active model. The companion cache's `modelProvider`
 -- (omp's live `ctx.model`) is the only source that follows /model switches, so it wins while
 -- the cache is fresh AND the writer sits in the focused agent's cwd (see cache_matches); the
--- agent block's model string is fixed at spawn and otherwise fills in.
-register("provider", function(snap, seg)
+-- agent block's model string is fixed at spawn and otherwise fills in. ACP panes show the ACP
+-- agent's name. The budget widget gates on this same answer (only aihub has a gateway budget).
+local function provider_name(snap: Snapshot): string?
 	if snap.acp then
-		return { text = snap.acp, tone = seg.color or "accent" }
+		return snap.acp
 	end
 	local name: string? = provider_of_display(snap.model)
 	if not name and cache_matches(snap) then
@@ -482,7 +542,16 @@ register("provider", function(snap, seg)
 	if not name or name == "" then
 		return nil
 	end
-	return { text = name, tone = seg.color or "accent" }
+	return name
+end
+segments.provider_name = provider_name
+
+register("provider", function(snap, seg)
+	local name = provider_name(snap)
+	if not name then
+		return nil
+	end
+	return { text = name, tone = seg.color or "accent", short = seg.compactIcon, title = "Provider: " .. name }
 end)
 
 -- usage — the active provider's windows as `5H ━●── 77% 1h` groups, joined by `·`. Bars render
@@ -534,7 +603,14 @@ register("usage", function(snap, seg)
 			table.insert(parts, (if wi == 1 then provider.label .. " " else "") .. piece)
 		end
 	end
-	return { text = table.concat(parts, " · "), tone = format.threshold(worst, tone, seg.warnAt, seg.badAt) }
+	local text = table.concat(parts, " · ")
+	return {
+		text = text,
+		tone = format.threshold(worst, tone, seg.warnAt, seg.badAt),
+		short = string.format("%s %d%%", seg.compactIcon, worst),
+		title = "Usage: " .. text,
+		value = worst / 100,
+	}
 end)
 
 -- context — the composer context meter, scraped: `󰆧 23%`.
@@ -544,9 +620,13 @@ register("context", function(snap, seg)
 	if not pct then
 		return nil
 	end
+	local shown = math.floor(pct + 0.5)
 	return {
-		text = string.format("󰆧 %d%%", math.floor(pct + 0.5)),
+		text = string.format("󰆧 %d%%", shown),
 		tone = format.threshold(pct, seg.color or "muted", seg.warnAt, seg.badAt),
+		short = string.format("%s %d%%", seg.compactIcon, shown),
+		title = string.format("Context: %d%% used", shown),
+		value = pct / 100,
 	}
 end)
 
@@ -559,7 +639,13 @@ register("budget", function(snap, seg)
 	end
 	local text = format.usd(budget.spent) .. (if budget.limit then "/" .. format.usd(budget.limit) else "")
 	local pct = if budget.limit and budget.limit > 0 then (budget.spent / budget.limit) * 100 else nil
-	return { text = "󰆼 " .. text, tone = format.threshold(pct, seg.color or "accent", seg.warnAt, seg.badAt) }
+	return {
+		text = "󰆼 " .. text,
+		tone = format.threshold(pct, seg.color or "accent", seg.warnAt, seg.badAt),
+		short = seg.compactIcon .. " " .. format.usd(budget.spent),
+		title = "Budget: " .. format.usd(budget.spent) .. (if budget.limit then " of " .. format.usd(budget.limit) else "") .. " today",
+		value = if pct then pct / 100 else nil,
+	}
 end)
 
 -- cost — session spend with per-message average: `󰔛 $1.20 · ~$0.08/msg`.
@@ -569,30 +655,15 @@ register("cost", function(snap, seg)
 		return nil
 	end
 	local text = "󰔛 " .. snap.session_cost
+	local title = "Cost: " .. snap.session_cost
 	if snap.session_turns and snap.session_turns > 1 then
 		local total = format.parse_usd(snap.session_cost)
 		if total then
 			text ..= string.format(" · ~$%.2f/msg", total / snap.session_turns)
 		end
+		title ..= string.format(" · %d msgs", snap.session_turns)
 	end
-	return { text = text, tone = seg.color or "muted" }
-end)
-
--- memory — the focused omp session's RSS: `󰍛 412M`. The cache carries the writer process's own
--- RSS (exact, no guessing among omp processes); the largest-omp `ps` scan fills in when the cache
--- is stale or absent, so pre-update sessions still render a value.
-register("memory", function(snap, seg)
-	local bytes: number? = nil
-	if cache_matches(snap) and snap.cache_rss then
-		bytes = snap.cache_rss
-	end
-	if not bytes then
-		bytes = snap.memory_bytes
-	end
-	if not bytes then
-		return nil
-	end
-	return { text = "󰍛 " .. format.memory(bytes :: number), tone = seg.color or "muted" }
+	return { text = text, tone = seg.color or "muted", short = seg.compactIcon .. " " .. snap.session_cost, title = title }
 end)
 
 -- aws — the login shell's AWS_PROFILE, captured by the fish poller into the snapshot: `☁ nsx`.
@@ -601,7 +672,7 @@ register("aws", function(snap, seg)
 	if not value or value == "" then
 		return nil
 	end
-	return { text = "☁ " .. value, tone = seg.color or "warn" }
+	return { text = "☁ " .. value, tone = seg.color or "warn", short = seg.compactIcon, title = "AWS: " .. value }
 end)
 
 local function strip_all(text: string, patterns: { string }): string
@@ -628,7 +699,7 @@ register("kube", function(snap, seg)
 	if display == "" then
 		return nil
 	end
-	return { text = "⎈ " .. display, tone = seg.color or "ok" }
+	return { text = "⎈ " .. display, tone = seg.color or "ok", short = seg.compactIcon, title = "Kube: " .. display }
 end)
 
 function segments.render(name: SegmentName, snap: Snapshot, seg: SegmentConfig): Rendered?
@@ -653,6 +724,8 @@ local detail = {}
 
 local DETAIL_SHEET = "statusline-detail"
 local PANEL_TITLE = "omp Statusline: Detail"
+-- The detail panel's default chord (Tern chord syntax, user-rebindable).
+local PANEL_KEYS = "ctrl+alt+s"
 
 -- One line per fact; segments append theirs.
 type Row = { label: string, value: string, tone: Tone? }
@@ -701,16 +774,6 @@ local function build_rows(cfg: Config, snap: Snapshot, path: string?): { Row }
 		local turns = if snap.session_turns then string.format(" · %d msgs", snap.session_turns) else ""
 		table.insert(rows, row("Session cost", snap.session_cost .. turns))
 	end
-	local detail_rss: number? = nil
-	if cache_matches(snap) and snap.cache_rss then
-		detail_rss = snap.cache_rss
-	end
-	if not detail_rss then
-		detail_rss = snap.memory_bytes
-	end
-	if detail_rss then
-		table.insert(rows, row("Memory", format.memory(detail_rss :: number)))
-	end
 	local kube = snap.kube
 	if cache_matches(snap) and snap.cache_kube and snap.cache_kube ~= "" then
 		kube = snap.cache_kube
@@ -755,8 +818,8 @@ function detail.sheet(): string
 end
 
 -- ── package: chrome ────────────────────────────────────────────────────────────
--- Wires data to the status bar: one focus/refresh loop, per-source pollers, and the prebuilt
--- segment table the 4 ms formatter returns. Owns all timing.
+-- Wires data to the widget bar: one focus/refresh loop, per-source pollers, the prebuilt widget
+-- views (per pane class) every widget render returns, and the legacy status table. Owns all timing.
 
 type StatusSegment = { text: string, icon: string?, tone: string?, command: string? }
 
@@ -833,10 +896,10 @@ end
 local agent_fields: { model: string?, state: "ready" | "working" | "waiting" | "exited", pane: number?, cwd: string?, acp: string? } = {
 	state = "exited",
 }
-local cache_fields: { providers: { Provider }, model_provider: string?, cache_at: number?, context_pct: number?, session_cost: string?, session_turns: number?, cwd: string?, kube: string?, rss: number? } = {
+local cache_fields: { providers: { Provider }, model_provider: string?, cache_at: number?, context_pct: number?, session_cost: string?, session_turns: number?, cwd: string?, kube: string? } = {
 	providers = {},
 }
-local proc_fields: { memory_bytes: number?, kube: string?, aws_profile: string? } = {}
+local proc_fields: { kube: string?, aws_profile: string? } = {}
 
 -- Forward-declared: publish rebuilds the prebuilt bar, so every data source lands visibly.
 local rebuild: () -> ()
@@ -856,12 +919,10 @@ local function publish()
 		model_provider = cache_fields.model_provider,
 		cache_cwd = cache_fields.cwd,
 		cache_kube = cache_fields.kube,
-		cache_rss = cache_fields.rss,
 		cache_at = cache_fields.cache_at,
 		context_pct = cache_fields.context_pct,
 		session_cost = cache_fields.session_cost,
 		session_turns = cache_fields.session_turns,
-		memory_bytes = proc_fields.memory_bytes,
 		kube = proc_fields.kube,
 		aws_profile = proc_fields.aws_profile,
 		at = os.time() * 1000,
@@ -1029,12 +1090,8 @@ local function parse_cache(text: string): (typeof(cache_fields), string?)
 	if type(doc.kube) == "string" and (doc.kube :: string) ~= "" then
 		kube = doc.kube
 	end
-	local rss: number? = nil
-	if type(doc.rssBytes) == "number" and (doc.rssBytes :: number) > 0 then
-		rss = doc.rssBytes
-	end
 	-- the file also refreshes config when its version bumps; a present file confirms the extension
-	return { providers = providers, model_provider = provider, cache_at = cache_at, context_pct = context, session_cost = cost, session_turns = turns, cwd = cwd, kube = kube, rss = rss }, nil
+	return { providers = providers, model_provider = provider, cache_at = cache_at, context_pct = context, session_cost = cost, session_turns = turns, cwd = cwd, kube = kube }, nil
 end
 
 -- Reads the focused project's cache. cache_fields only ever holds values for the focused agent's
@@ -1049,7 +1106,7 @@ function read_cache(cx: WindowCx?)
 	local path = if cwd and cwd ~= "" then cache_file(cwd) else nil
 	if not path then
 		-- no focused agent: drop stale cache-driven segments instead of showing another project's
-		if next(cache_fields.providers) ~= nil or cache_fields.model_provider or cache_fields.kube or cache_fields.rss or cache_fields.cache_at then
+		if next(cache_fields.providers) ~= nil or cache_fields.model_provider or cache_fields.kube or cache_fields.cache_at then
 			cache_fields = { providers = {} }
 			publish()
 			chrome.refresh()
@@ -1098,16 +1155,27 @@ local function poll_cache(cx: WindowCx?)
 	end
 end
 
--- Process polls: kube context, AWS profile and omp RSS. Each on its own cadence, async callbacks only.
+-- Process polls: kube context and AWS profile. Each on its own cadence (`segments.<id>.refreshMs`,
+-- re-read every round) with its own process timeout (`timeoutMs`); async callbacks only.
 local KUBE_MS = 10000
 local AWS_MS = 30000
-local MEMORY_MS = 10000
+local PROC_TIMEOUT_MS = 5000
+
+local function poll_ms(name: SegmentName, fallback: number): number
+	local seg = cfg.segments[name]
+	return (seg and seg.refreshMs) or fallback
+end
+
+local function poll_timeout(name: SegmentName): number
+	local seg = cfg.segments[name]
+	return (seg and seg.timeoutMs) or PROC_TIMEOUT_MS
+end
 
 -- `tern.process.run` raises when the binary can't spawn from Tern's launchd PATH; callers treat
 -- that as a failed attempt instead of losing the timer chain.
-local function run(argv: { string }, cb: (result: any, cx: any?) -> ())
+local function run(argv: { string }, timeout_ms: number, cb: (result: any, cx: any?) -> ())
 	local ok = pcall(function()
-		tern.process.run(argv, { timeout_ms = 5000 }, cb)
+		tern.process.run(argv, { timeout_ms = timeout_ms }, cb)
 	end)
 	if not ok then
 		cb({ status = -1 }, nil)
@@ -1118,7 +1186,7 @@ local function poll_kube()
 	-- Tern's launchd PATH lacks the user's shell paths and the mise shim needs mise's env
 	-- (shim errors "no version is set" under launchd), so call the real binary. `latest` is
 	-- mise's stable symlink to the active install, surviving version bumps.
-	run({ "/Users/yuri/.local/share/mise/installs/kubectl/latest/kubectl", "config", "current-context" }, function(shim_result, _cx)
+	run({ "/Users/yuri/.local/share/mise/installs/kubectl/latest/kubectl", "config", "current-context" }, poll_timeout("kube"), function(shim_result, _cx)
 		local shim_current = if shim_result.status == 0 then (shim_result.stdout or ""):gsub("%s+$", "") else ""
 		if shim_current ~= nil and (shim_current :: string) ~= "" then
 			proc_fields.kube = shim_current :: string
@@ -1126,7 +1194,7 @@ local function poll_kube()
 			return
 		end
 		-- No current-context: exactly one configured context is an unambiguous fallback
-		run({ "/Users/yuri/.local/share/mise/installs/kubectl/latest/kubectl", "config", "get-contexts", "-o", "name" }, function(fallback, _cx)
+		run({ "/Users/yuri/.local/share/mise/installs/kubectl/latest/kubectl", "config", "get-contexts", "-o", "name" }, poll_timeout("kube"), function(fallback, _cx)
 			if fallback.status ~= 0 then
 				proc_fields.kube = nil
 				publish()
@@ -1149,30 +1217,9 @@ end
 -- AWS_PROFILE is a fish universal var set with `set -Ux` (conf.d/environment.fish); fish -N
 -- skips config and doesn't export it, so load the normal config despite the startup cost.
 local function poll_aws()
-	run({ "/opt/homebrew/bin/fish", "-c", "echo $AWS_PROFILE" }, function(result, _cx)
+	run({ "/opt/homebrew/bin/fish", "-c", "echo $AWS_PROFILE" }, poll_timeout("aws"), function(result, _cx)
 		local value = if result.status == 0 then (result.stdout or ""):gsub("%s+$", "") else ""
 		proc_fields.aws_profile = if value ~= nil and (value :: string) ~= "" then value :: string else nil
-		publish()
-	end)
-end
-
-local function poll_memory()
-	run({ "ps", "-axo", "rss=,command=" }, function(result, _cx)
-		local stdout = if result.status == 0 then (result.stdout or "") else ""
-		if result.status ~= 0 or stdout == "" then
-			return
-		end
-		local best: number? = nil
-		for line in (stdout :: string):gmatch("[^\n]+") do
-			local rss = tonumber(string.match(line, "^%s*(%d+)") or "")
-			if rss and line:find("omp", 1, true) and line:find("agent", 1, true) then
-				-- largest matching omp agent process wins
-				best = if best == nil or rss > best then rss else best
-			end
-		end
-		if best then
-			proc_fields.memory_bytes = best * 1024
-		end
 		publish()
 	end)
 end
@@ -1227,14 +1274,154 @@ local function compose(cfg0: Config, snap: Snapshot): ({ StatusSegment }, string
 	return out, table.concat(sig, "\n")
 end
 
--- Rebuilds the prebuilt table when the snapshot changed anything visible. Runs from callbacks,
--- never the formatter.
+-- ── widgets ──
+-- One Tern widget per segment (`<plugin>/<segment>`), placed by the user in the widget bar.
+-- Applicability depends on what the focused pane is, so views are prebuilt per pane class:
+--   agent     an agent pane; omp vs ACP comes from the snapshot (`snap.acp`)
+--   cli       a terminal running the claude CLI (`c`, `claude`): no agent block backs it
+--   terminal  anything else (plain shells, no pane): only agent-independent segments apply
+-- `render` classifies the pane (a field compare) and returns `views[class][name]`, nothing else.
+
+type PaneClass = "agent" | "cli" | "terminal"
+type WidgetViewT = { text: string, tone: string?, title: string?, command: string?, value: number? }
+
+local PANE_CLASSES: { PaneClass } = { "agent", "cli", "terminal" }
+
+-- Editor tiles are narrow: each description leads with a sample of the widget, then where it
+-- applies. Tern's WidgetSpec has no preview/sample hook, so a tile on a pane where the widget
+-- doesn't apply shows only its name and this line.
+local WIDGETS: { [SegmentName]: { label: string, description: string, styles: { string } } } = {
+	indicator = { label = "Indicator", description = "omp state glyph: ready/working · omp panes", styles = { "text" } },
+	provider = { label = "Provider", description = "aihub / zai / claude · agent + claude CLI", styles = { "text" } },
+	usage = { label = "Usage", description = "5H ━━●── 50% left · omp panes", styles = { "text", "bar", "ring" } },
+	context = { label = "Context", description = "󰆧 23% context used · omp panes", styles = { "text", "bar", "ring" } },
+	budget = { label = "Budget", description = "󰆼 $12/$200 AI Hub spend · aihub only", styles = { "text", "bar", "ring" } },
+	cost = { label = "Cost", description = "󰔛 $1.20 · ~$0.08/msg · omp panes", styles = { "text" } },
+	aws = { label = "AWS", description = "☁ sre · every pane", styles = { "text" } },
+	kube = { label = "Kube", description = "⎈ talos-default · every pane", styles = { "text" } },
+}
+
+local function pane_class(pane: any): PaneClass
+	if pane == nil then
+		return "terminal"
+	end
+	if pane.kind == "agent" then
+		return "agent"
+	end
+	if is_claude_cli(pane) then
+		return "cli"
+	end
+	return "terminal"
+end
+
+-- The snapshot as each pane class should see it. A CLI pane is always the claude ACP agent; a
+-- plain terminal has no agent at all, so agent-scoped cache data (kube) must not leak in.
+local function snapshot_for(class: PaneClass, snap: Snapshot): Snapshot
+	if class == "agent" then
+		return snap
+	end
+	local out = table.clone(snap)
+	out.model = nil
+	out.agent_cwd = nil
+	if class == "cli" then
+		out.acp = "claude"
+		out.state = "ready"
+	else
+		out.acp = nil
+		out.state = "exited"
+	end
+	return out
+end
+
+-- Does segment `name` apply to a pane of `class` (seen through `snap`)? No data is decided later.
+local function applies(name: SegmentName, class: PaneClass, snap: Snapshot): boolean
+	local omp = class == "agent" and snap.acp == nil
+	if name == "indicator" or name == "cost" or name == "usage" or name == "context" then
+		return omp
+	elseif name == "provider" then
+		return class == "agent" or class == "cli"
+	elseif name == "budget" then
+		return class == "agent" and segments.provider_name(snap) == "aihub"
+	end
+	return true -- aws, kube: every pane
+end
+
+local function widget_view(name: SegmentName, class: PaneClass, cfg0: Config, snap: Snapshot): WidgetViewT?
+	local seg = cfg0.segments[name]
+	if not cfg0.enabled or not seg or not seg.enabled then
+		return nil
+	end
+	local item: Rendered? = if applies(name, class, snap) then segments.render(name, snap, seg) else nil
+	if not item then
+		if seg.inapplicable == "compact" then
+			return { text = seg.compactIcon, tone = "muted", title = WIDGETS[name].label, command = DETAIL_ACTION }
+		end
+		return nil
+	end
+	local rendered = item :: Rendered
+	return {
+		text = if seg.compact then rendered.short or rendered.text else rendered.text,
+		tone = rendered.tone,
+		title = rendered.title or WIDGETS[name].label,
+		command = DETAIL_ACTION,
+		value = rendered.value,
+	}
+end
+
+local views: { [PaneClass]: { [SegmentName]: WidgetViewT } } = { agent = {}, cli = {}, terminal = {} }
+
+-- False when `tern.chrome.widget` is missing or any registration raised: the legacy status
+-- formatter then turns on by itself, so the bar is never silently empty.
+local widgets_ok = true
+
+local function status_on(): boolean
+	return cfg.statusSegments or not widgets_ok
+end
+local views_sig = ""
+
+local function view_sig(v: WidgetViewT): string
+	return table.concat({ v.text, v.tone or "", v.title or "", v.command or "", if v.value then string.format("%.4f", v.value) else "" }, "\1")
+end
+
+-- Rebuilds the prebuilt widget views and the legacy status table when anything visible changed,
+-- then asks Tern to redraw. Runs from callbacks, never a formatter or render.
 rebuild = function()
 	local snap = data.snapshot()
-	local out, sig = compose(cfg, snap)
-	if sig ~= built_sig then
-		built = out
-		built_sig = sig
+	local changed = false
+	local next_views: { [PaneClass]: { [SegmentName]: WidgetViewT } } = {}
+	local sig: { string } = {}
+	for _, class in PANE_CLASSES do
+		local seen = snapshot_for(class, snap)
+		local by: { [SegmentName]: WidgetViewT } = {}
+		for _, name in SEGMENT_NAMES do
+			local v = widget_view(name, class, cfg, seen)
+			if v then
+				by[name] = v
+				table.insert(sig, class .. "/" .. name .. "\1" .. view_sig(v))
+			end
+		end
+		next_views[class] = by
+	end
+	local joined = table.concat(sig, "\n")
+	if joined ~= views_sig then
+		views = next_views
+		views_sig = joined
+		changed = true
+	end
+	if status_on() then
+		local out, status_sig = compose(cfg, snap)
+		if status_sig ~= built_sig then
+			built = out
+			built_sig = status_sig
+			changed = true
+		end
+	elseif built_sig ~= "" then
+		built = {}
+		built_sig = ""
+		changed = true
+	end
+	if changed then
+		tern.chrome.refresh()
 	end
 end
 
@@ -1246,13 +1433,69 @@ function chrome.refresh()
 	tern.chrome.refresh()
 end
 
--- 4 ms budget: return the prebuilt table, nothing else.
+-- Records which pane the chrome shows, so poll_agents follows it. Same rule both formatters use:
+-- only agent and claude CLI panes move `shown_pane`; a plain terminal keeps the last agent's.
+local function note_pane(pane: any): PaneClass
+	local class = pane_class(pane)
+	if pane ~= nil then
+		shown_cli = cfg.enabled and class == "cli"
+		if cfg.enabled and class ~= "terminal" then
+			shown_pane = pane.pane
+		end
+	end
+	return class
+end
+
+-- Moves `shown_pane`/`shown_cli` to the pane a focus event names, before anything polls: the
+-- renders that would otherwise move them only run after the refresh, so the first frame on the
+-- new pane would show the old pane's agent. Falls back to the session's focused pane.
+function chrome.note_focus(ev: any, cx: WindowCx)
+	local id: number? = if type(ev) == "table" and type(ev.pane) == "number" then ev.pane else nil
+	if id == nil then
+		local ok, focused = pcall(function(): any
+			return cx.session:focused()
+		end)
+		id = if ok and type(focused) == "number" then focused else nil
+	end
+	if id == nil then
+		return
+	end
+	local ok, info = pcall(function(): any
+		return cx.session:pane(id :: number)
+	end)
+	if ok and type(info) == "table" then
+		note_pane(info)
+	end
+end
+
+-- 4 ms budget: each widget's render records the pane and returns its prebuilt view, nothing else.
+for _, name in SEGMENT_NAMES do
+	local meta = WIDGETS[name]
+	local ok, err = pcall(function()
+		tern.chrome.widget(name, {
+			name = "SL " .. meta.label,
+			description = meta.description,
+			styles = meta.styles :: any,
+			render = function(pane: StatusPaneInfo?): WidgetView?
+				local class = note_pane(pane)
+				return (views[class] :: any)[name]
+			end,
+		})
+	end)
+	if not ok then
+		widgets_ok = false
+		tern.log.warn("statusline widget " .. name .. ": " .. tostring(err) .. " (falling back to the status formatter)")
+	end
+end
+
+-- Legacy single-formatter path, off unless `statusSegments = true` or widgets failed to register
+-- (see `widgets_ok`). 4 ms budget: return the
+-- prebuilt table, nothing else.
 tern.chrome.status(function(pane: StatusPaneInfo): { StatusSegment }?
-	shown_cli = cfg.enabled and is_claude_cli(pane)
-	if not cfg.enabled or (pane.kind ~= "agent" and not shown_cli) then
+	local class = note_pane(pane)
+	if not cfg.enabled or not status_on() or class == "terminal" then
 		return nil
 	end
-	shown_pane = pane.pane
 	return built
 end)
 
@@ -1325,8 +1568,10 @@ tern.on("window_start", function(cx: WindowCx)
 	last_cx = cx
 end)
 
-tern.on("focus", function(_ev, cx: WindowCx)
+tern.on("focus", function(ev: FocusEvent?, cx: WindowCx)
 	last_cx = cx
+	-- the focused pane leads the poll (and the cache read it kicks on a cwd change)
+	chrome.note_focus(ev, cx)
 	chrome.refresh()
 	sync_panel(cx)
 end)
@@ -1369,7 +1614,7 @@ tern.timer(300, function(cx: WindowCx?)
 end)
 
 -- Cadences run forever; each schedules its own next tick.
-local function cadence(ms: number, fn: () -> ())
+local function cadence(ms: number | () -> number, fn: () -> ())
 	local tick: () -> ()
 	tick = function()
 		local ok, err = pcall(fn)
@@ -1377,16 +1622,15 @@ local function cadence(ms: number, fn: () -> ())
 			-- a failing poller must not take the others down; log once per failure
 			tern.log.warn("statusline poll failed: " .. tostring(err))
 		end
-		tern.timer(ms, tick)
+		tern.timer(if type(ms) == "function" then ms() else ms, tick)
 	end
 	tern.timer(0, tick)
 end
 
 cadence(AGENT_POLL_MS, poll_agents)
 cadence(GATEWAY_MS, poll_gateway)
-cadence(KUBE_MS, poll_kube)
-cadence(AWS_MS, poll_aws)
-cadence(MEMORY_MS, poll_memory)
+cadence(function() return poll_ms("kube", KUBE_MS) end, poll_kube)
+cadence(function() return poll_ms("aws", AWS_MS) end, poll_aws)
 
 -- Gateway refresh also rebuilds the bar on fetch callbacks (they call publish); poll_agents ticks
 -- keep the model/state fresh between turns.
